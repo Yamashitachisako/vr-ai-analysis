@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
+from urllib.request import Request, urlopen
 
 # ページ設定
 st.set_page_config(
@@ -71,6 +72,16 @@ st.markdown("""
         padding-bottom: 0.3rem;
         margin: 1.5rem 0 1rem 0;
     }
+    .st-key-load_from_drive_btn button[kind="primary"] {
+        background-color: #0068C9 !important;
+        color: #ffffff !important;
+        border: 1px solid #0068C9 !important;
+    }
+    .st-key-load_from_drive_btn button[kind="primary"]:hover {
+        background-color: #0056A6 !important;
+        border-color: #0056A6 !important;
+        color: #ffffff !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,9 +118,39 @@ def to_google_drive_download_url(url: str) -> str:
     file_id = extract_google_drive_file_id(url)
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
+def read_csv_robust(content: bytes) -> pd.DataFrame:
+    """アップロード・Google Drive 共通の CSV 読み込み。"""
+    if content[:15].lower().startswith(b"<!doctype") or content[:6].lower().startswith(b"<html"):
+        raise ValueError(
+            "CSVではなくHTMLが返されました。"
+            "Google Driveの共有設定が「リンクを知っている全員が閲覧可」になっているか確認してください。"
+        )
+
+    last_error = None
+    for encoding in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            return pd.read_csv(
+                BytesIO(content),
+                engine="python",
+                on_bad_lines="skip",
+                encoding=encoding,
+            )
+        except UnicodeDecodeError as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"CSVの読み込みに失敗しました: {last_error}")
+
+def load_csv_from_upload(uploaded_file) -> pd.DataFrame:
+    return read_csv_robust(uploaded_file.getvalue())
+
 def load_csv_from_google_drive(url: str) -> pd.DataFrame:
     download_url = to_google_drive_download_url(url)
-    return pd.read_csv(download_url)
+    request = Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=60) as response:
+        content = response.read()
+    return read_csv_robust(content)
 
 # ヘッダー
 st.markdown('<div class="main-title">🏥 VR保育研修 分析ダッシュボード</div>', unsafe_allow_html=True)
@@ -127,12 +168,20 @@ uploaded_file = st.file_uploader("CSVをアップロード", type=["csv"])
 
 st.markdown("**Google Driveから読み込む**")
 drive_url = st.text_input("Google DriveのCSVリンク", value=DEFAULT_DRIVE_CSV_URL)
-load_from_drive = st.button("Google Driveから読み込む", type="primary", use_container_width=True)
+load_from_drive = st.button(
+    "Google Driveから読み込む",
+    type="primary",
+    use_container_width=True,
+    key="load_from_drive_btn",
+)
 st.markdown("---")
 
 df = None
 if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
+    try:
+        df = load_csv_from_upload(uploaded_file)
+    except Exception as e:
+        st.error(f"CSVの読み込みエラー: {e}")
 elif load_from_drive and drive_url.strip():
     try:
         with st.spinner("Google Driveから読み込み中..."):
