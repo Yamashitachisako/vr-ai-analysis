@@ -11,6 +11,27 @@ st.set_page_config(
     layout="wide"
 )
 
+# 認証
+VALID_USERNAME = "hyogo"
+VALID_PASSWORD = "test"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.markdown("## ログイン")
+    with st.form("login_form"):
+        username = st.text_input("ユーザー名")
+        password = st.text_input("パスワード", type="password")
+        submitted = st.form_submit_button("ログイン")
+        if submitted:
+            if username == VALID_USERNAME and password == VALID_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("ユーザー名またはパスワードが違います")
+    st.stop()
+
 # カスタムCSS
 st.markdown("""
 <style>
