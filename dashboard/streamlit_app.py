@@ -121,13 +121,14 @@ with st.sidebar:
     st.title("設定・フィルター")
     st.markdown("---")
 
-# CSV読み込み
-upload_col, drive_col = st.columns(2)
-with upload_col:
-    uploaded_file = st.file_uploader("📂 CSVをアップロード", type=["csv"])
-with drive_col:
-    drive_url = st.text_input("🔗 Google DriveのCSVリンク", value=DEFAULT_DRIVE_CSV_URL)
-    load_from_drive = st.button("Google Driveから読み込む")
+# CSV読み込み（ログイン後・メインエリア上部に常時表示）
+st.markdown('<div class="section-header">📂 データ読み込み</div>', unsafe_allow_html=True)
+uploaded_file = st.file_uploader("CSVをアップロード", type=["csv"])
+
+st.markdown("**Google Driveから読み込む**")
+drive_url = st.text_input("Google DriveのCSVリンク", value=DEFAULT_DRIVE_CSV_URL)
+load_from_drive = st.button("Google Driveから読み込む", type="primary", use_container_width=True)
+st.markdown("---")
 
 df = None
 if uploaded_file is not None:
