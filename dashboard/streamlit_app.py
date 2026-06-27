@@ -10,7 +10,6 @@ from io import BytesIO
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.pdf_builder import build_pdf_bytes
 
 # ページ設定
 st.set_page_config(
@@ -210,8 +209,10 @@ def load_csv_from_google_drive(url: str) -> pd.DataFrame:
     return standardize_columns(read_csv_robust(content))
 
 def render_pdf_section(report_df: pd.DataFrame) -> None:
-    """df 読み込み後に必ず表示する PDF レポート生成セクション。"""
+    """グラフ表示の下に必ず表示する PDF レポート生成セクション。"""
+    st.markdown("---")
     st.markdown('<div class="section-header">📄 PDFレポート生成</div>', unsafe_allow_html=True)
+
     if st.button(
         "📥 PDFレポートを生成",
         type="primary",
@@ -219,6 +220,8 @@ def render_pdf_section(report_df: pd.DataFrame) -> None:
         use_container_width=True,
     ):
         try:
+            from app.pdf_builder import build_pdf_bytes
+
             with st.spinner("PDFを生成中..."):
                 st.session_state.pdf_bytes = build_pdf_bytes(report_df)
                 st.session_state.pdf_error = None
@@ -360,167 +363,176 @@ if df is not None:
         else:
             st.metric("最短反応時間", "N/A")
 
-    render_pdf_section(filtered_df)
-
     # ── グラフ行1：反応時間推移 ＋ 事象別平均反応時間 ──
-    st.markdown('<div class="section-header">📈 反応時間分析</div>', unsafe_allow_html=True)
-    col_a, col_b = st.columns(2)
+    try:
+        st.markdown('<div class="section-header">📈 反応時間分析</div>', unsafe_allow_html=True)
+        col_a, col_b = st.columns(2)
 
-    with col_a:
-        if "reaction_time" in filtered_df.columns:
-            rt_df = filtered_df[filtered_df["reaction_time"] > 0].copy()
-            if "event_type" in rt_df.columns:
-                rt_df["color"] = rt_df["event_type"].apply(get_event_color)
-                fig_line = px.line(
-                    rt_df.reset_index(),
-                    x="index",
-                    y="reaction_time",
+        with col_a:
+            if "reaction_time" in filtered_df.columns:
+                rt_df = filtered_df[filtered_df["reaction_time"] > 0].copy()
+                if "event_type" in rt_df.columns:
+                    rt_df["color"] = rt_df["event_type"].apply(get_event_color)
+                    fig_line = px.line(
+                        rt_df.reset_index(),
+                        x="index",
+                        y="reaction_time",
+                        color="event_type",
+                        color_discrete_map=EVENT_COLORS,
+                        title="反応時間の推移（事象別）",
+                        labels={"index": "レコード番号", "reaction_time": "反応時間（秒）", "event_type": "事象"}
+                    )
+                else:
+                    fig_line = px.line(rt_df.reset_index(), x="index", y="reaction_time", title="反応時間の推移")
+                fig_line.update_layout(height=350)
+                st.plotly_chart(fig_line, use_container_width=True)
+
+        with col_b:
+            if "event_type" in filtered_df.columns and "reaction_time" in filtered_df.columns:
+                event_avg = (
+                    filtered_df[filtered_df["reaction_time"] > 0]
+                    .groupby("event_type")["reaction_time"]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={"reaction_time": "平均反応時間"})
+                )
+                event_avg = event_avg[event_avg["event_type"] != "None"]
+                event_avg["color"] = event_avg["event_type"].apply(get_event_color)
+                fig_bar = px.bar(
+                    event_avg,
+                    x="event_type",
+                    y="平均反応時間",
                     color="event_type",
                     color_discrete_map=EVENT_COLORS,
-                    title="反応時間の推移（事象別）",
-                    labels={"index": "レコード番号", "reaction_time": "反応時間（秒）", "event_type": "事象"}
+                    title="事象別 平均反応時間",
+                    labels={"event_type": "事象", "平均反応時間": "平均反応時間（秒）"}
                 )
-            else:
-                fig_line = px.line(rt_df.reset_index(), x="index", y="reaction_time", title="反応時間の推移")
-            fig_line.update_layout(height=350)
-            st.plotly_chart(fig_line, use_container_width=True)
-
-    with col_b:
-        if "event_type" in filtered_df.columns and "reaction_time" in filtered_df.columns:
-            event_avg = (
-                filtered_df[filtered_df["reaction_time"] > 0]
-                .groupby("event_type")["reaction_time"]
-                .mean()
-                .reset_index()
-                .rename(columns={"reaction_time": "平均反応時間"})
-            )
-            event_avg = event_avg[event_avg["event_type"] != "None"]
-            event_avg["color"] = event_avg["event_type"].apply(get_event_color)
-            fig_bar = px.bar(
-                event_avg,
-                x="event_type",
-                y="平均反応時間",
-                color="event_type",
-                color_discrete_map=EVENT_COLORS,
-                title="事象別 平均反応時間",
-                labels={"event_type": "事象", "平均反応時間": "平均反応時間（秒）"}
-            )
-            fig_bar.update_layout(height=350, showlegend=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
+                fig_bar.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_bar, use_container_width=True)
+    except Exception as e:
+        st.warning(f"反応時間分析グラフの表示エラー: {e}")
 
     # ── グラフ行2：保育者別比較 ＋ 場所別ヒートマップ ──
-    col_c, col_d = st.columns(2)
+    try:
+        col_c, col_d = st.columns(2)
 
-    with col_c:
-        st.markdown('<div class="section-header">👤 保育者別 反応時間比較</div>', unsafe_allow_html=True)
-        if "player_id" in filtered_df.columns and "reaction_time" in filtered_df.columns:
-            player_avg = (
-                filtered_df[filtered_df["reaction_time"] > 0]
-                .groupby("player_id")["reaction_time"]
-                .mean()
-                .reset_index()
-                .rename(columns={"reaction_time": "平均反応時間"})
-            )
-            fig_player = px.bar(
-                player_avg,
-                x="player_id",
-                y="平均反応時間",
-                color="player_id",
-                title="保育者別 平均反応時間",
-                labels={"player_id": "保育者ID", "平均反応時間": "平均反応時間（秒）"}
-            )
-            fig_player.update_layout(height=350, showlegend=False)
-            st.plotly_chart(fig_player, use_container_width=True)
+        with col_c:
+            st.markdown('<div class="section-header">👤 保育者別 反応時間比較</div>', unsafe_allow_html=True)
+            if "player_id" in filtered_df.columns and "reaction_time" in filtered_df.columns:
+                player_avg = (
+                    filtered_df[filtered_df["reaction_time"] > 0]
+                    .groupby("player_id")["reaction_time"]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={"reaction_time": "平均反応時間"})
+                )
+                fig_player = px.bar(
+                    player_avg,
+                    x="player_id",
+                    y="平均反応時間",
+                    color="player_id",
+                    title="保育者別 平均反応時間",
+                    labels={"player_id": "保育者ID", "平均反応時間": "平均反応時間（秒）"}
+                )
+                fig_player.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_player, use_container_width=True)
 
-    with col_d:
-        st.markdown('<div class="section-header">📍 場所別 危険イベント数</div>', unsafe_allow_html=True)
-        if "location" in filtered_df.columns and "event_type" in filtered_df.columns:
-            loc_df = filtered_df[
-                filtered_df["event_type"].notna() & (filtered_df["event_type"] != "None")
-            ]
-            loc_count = loc_df.groupby(["location", "event_type"]).size().reset_index(name="件数")
-            fig_loc = px.bar(
-                loc_count,
-                x="location",
-                y="件数",
-                color="event_type",
-                color_discrete_map=EVENT_COLORS,
-                title="場所別 危険イベント発生数",
-                labels={"location": "場所", "件数": "件数", "event_type": "事象"}
-            )
-            fig_loc.update_layout(height=350)
-            st.plotly_chart(fig_loc, use_container_width=True)
-
-    # ── グラフ行3：Event_Type / Target_Object 別件数 ＋ Data_Value推移 ──
-    st.markdown('<div class="section-header">📊 イベント集計</div>', unsafe_allow_html=True)
-    col_e, col_f = st.columns(2)
-
-    with col_e:
-        if "event_type" in filtered_df.columns:
-            event_count = (
-                filtered_df[filtered_df["event_type"].notna() & (filtered_df["event_type"].astype(str) != "None")]
-                .groupby("event_type")
-                .size()
-                .reset_index(name="件数")
-            )
-            if not event_count.empty:
-                fig_event_count = px.bar(
-                    event_count,
-                    x="event_type",
+        with col_d:
+            st.markdown('<div class="section-header">📍 場所別 危険イベント数</div>', unsafe_allow_html=True)
+            if "location" in filtered_df.columns and "event_type" in filtered_df.columns:
+                loc_df = filtered_df[
+                    filtered_df["event_type"].notna() & (filtered_df["event_type"] != "None")
+                ]
+                loc_count = loc_df.groupby(["location", "event_type"]).size().reset_index(name="件数")
+                fig_loc = px.bar(
+                    loc_count,
+                    x="location",
                     y="件数",
                     color="event_type",
                     color_discrete_map=EVENT_COLORS,
-                    title="Event_Type別 件数",
-                    labels={"event_type": "事象", "件数": "件数"},
+                    title="場所別 危険イベント発生数",
+                    labels={"location": "場所", "件数": "件数", "event_type": "事象"}
                 )
-                fig_event_count.update_layout(height=350, showlegend=False)
-                st.plotly_chart(fig_event_count, use_container_width=True)
+                fig_loc.update_layout(height=350)
+                st.plotly_chart(fig_loc, use_container_width=True)
+    except Exception as e:
+        st.warning(f"保育者別・場所別グラフの表示エラー: {e}")
 
-    with col_f:
-        target_col = "target_object" if "target_object" in filtered_df.columns else "location"
-        if target_col in filtered_df.columns:
-            target_count = (
-                filtered_df[filtered_df[target_col].notna() & (filtered_df[target_col].astype(str) != "None")]
-                .groupby(target_col)
-                .size()
-                .reset_index(name="件数")
-            )
-            if not target_count.empty:
-                fig_target_count = px.bar(
-                    target_count,
-                    x=target_col,
-                    y="件数",
-                    color=target_col,
-                    title="Target_Object別 件数",
-                    labels={target_col: "対象オブジェクト", "件数": "件数"},
+    # ── グラフ行3：Event_Type / Target_Object 別件数 ＋ Data_Value推移 ──
+    try:
+        st.markdown('<div class="section-header">📊 イベント集計</div>', unsafe_allow_html=True)
+        col_e, col_f = st.columns(2)
+
+        with col_e:
+            if "event_type" in filtered_df.columns:
+                event_count = (
+                    filtered_df[filtered_df["event_type"].notna() & (filtered_df["event_type"].astype(str) != "None")]
+                    .groupby("event_type")
+                    .size()
+                    .reset_index(name="件数")
                 )
-                fig_target_count.update_layout(height=350, showlegend=False)
-                st.plotly_chart(fig_target_count, use_container_width=True)
+                if not event_count.empty:
+                    fig_event_count = px.bar(
+                        event_count,
+                        x="event_type",
+                        y="件数",
+                        color="event_type",
+                        color_discrete_map=EVENT_COLORS,
+                        title="Event_Type別 件数",
+                        labels={"event_type": "事象", "件数": "件数"},
+                    )
+                    fig_event_count.update_layout(height=350, showlegend=False)
+                    st.plotly_chart(fig_event_count, use_container_width=True)
 
-    value_col = "data_value" if "data_value" in filtered_df.columns else "reaction_time"
-    if value_col in filtered_df.columns:
-        dv_df = filtered_df.copy()
-        dv_df[value_col] = pd.to_numeric(dv_df[value_col], errors="coerce")
-        dv_df = dv_df[dv_df[value_col].notna()]
-        if not dv_df.empty:
-            if "timestamp" in dv_df.columns:
-                x_col = "timestamp"
-                x_label = "経過時間"
-            else:
-                dv_df = dv_df.reset_index()
-                x_col = "index"
-                x_label = "レコード番号"
-            fig_data_value = px.line(
-                dv_df,
-                x=x_col,
-                y=value_col,
-                color="event_type" if "event_type" in dv_df.columns else None,
-                color_discrete_map=EVENT_COLORS,
-                title="Data_Valueの推移",
-                labels={x_col: x_label, value_col: "Data_Value", "event_type": "事象"},
-            )
-            fig_data_value.update_layout(height=350)
-            st.plotly_chart(fig_data_value, use_container_width=True)
+        with col_f:
+            target_col = "target_object" if "target_object" in filtered_df.columns else "location"
+            if target_col in filtered_df.columns:
+                target_count = (
+                    filtered_df[filtered_df[target_col].notna() & (filtered_df[target_col].astype(str) != "None")]
+                    .groupby(target_col)
+                    .size()
+                    .reset_index(name="件数")
+                )
+                if not target_count.empty:
+                    fig_target_count = px.bar(
+                        target_count,
+                        x=target_col,
+                        y="件数",
+                        color=target_col,
+                        title="Target_Object別 件数",
+                        labels={target_col: "対象オブジェクト", "件数": "件数"},
+                    )
+                    fig_target_count.update_layout(height=350, showlegend=False)
+                    st.plotly_chart(fig_target_count, use_container_width=True)
+
+        value_col = "data_value" if "data_value" in filtered_df.columns else "reaction_time"
+        if value_col in filtered_df.columns:
+            dv_df = filtered_df.copy()
+            dv_df[value_col] = pd.to_numeric(dv_df[value_col], errors="coerce")
+            dv_df = dv_df[dv_df[value_col].notna()]
+            if not dv_df.empty:
+                if "timestamp" in dv_df.columns:
+                    x_col = "timestamp"
+                    x_label = "経過時間"
+                else:
+                    dv_df = dv_df.reset_index()
+                    x_col = "index"
+                    x_label = "レコード番号"
+                fig_data_value = px.line(
+                    dv_df,
+                    x=x_col,
+                    y=value_col,
+                    color="event_type" if "event_type" in dv_df.columns else None,
+                    color_discrete_map=EVENT_COLORS,
+                    title="Data_Valueの推移",
+                    labels={x_col: x_label, value_col: "Data_Value", "event_type": "事象"},
+                )
+                fig_data_value.update_layout(height=350)
+                st.plotly_chart(fig_data_value, use_container_width=True)
+    except Exception as e:
+        st.warning(f"イベント集計グラフの表示エラー: {e}")
+
+    render_pdf_section(filtered_df)
 
 else:
     st.info("👆 CSVファイルをアップロードするか、Google Driveのリンクから読み込んでください。")
