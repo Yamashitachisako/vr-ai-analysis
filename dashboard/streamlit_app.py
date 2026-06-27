@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -88,6 +89,28 @@ EVENT_COLORS = {
 def get_event_color(event_type):
     return EVENT_COLORS.get(str(event_type), "#3498db")
 
+DEFAULT_DRIVE_CSV_URL = (
+    "https://drive.google.com/file/d/10s13cnRpNdIpdR4Gaeez5sCaewonj1a9/view?usp=sharing"
+)
+
+def extract_google_drive_file_id(url: str) -> str:
+    match = re.search(r"/file/d/([^/]+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([^&]+)", url)
+    if match:
+        return match.group(1)
+    return url.strip()
+
+def to_google_drive_download_url(url: str) -> str:
+    """共有リンクを pandas で読み込めるダウンロードURLに変換する。"""
+    file_id = extract_google_drive_file_id(url)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+def load_csv_from_google_drive(url: str) -> pd.DataFrame:
+    download_url = to_google_drive_download_url(url)
+    return pd.read_csv(download_url)
+
 # ヘッダー
 st.markdown('<div class="main-title">🏥 VR保育研修 分析ダッシュボード</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">VRセッションデータのアップロードと分析</div>', unsafe_allow_html=True)
@@ -98,11 +121,26 @@ with st.sidebar:
     st.title("設定・フィルター")
     st.markdown("---")
 
-# CSVアップロード
-uploaded_file = st.file_uploader("📂 CSVをアップロード", type=["csv"])
+# CSV読み込み
+upload_col, drive_col = st.columns(2)
+with upload_col:
+    uploaded_file = st.file_uploader("📂 CSVをアップロード", type=["csv"])
+with drive_col:
+    drive_url = st.text_input("🔗 Google DriveのCSVリンク", value=DEFAULT_DRIVE_CSV_URL)
+    load_from_drive = st.button("Google Driveから読み込む")
 
+df = None
 if uploaded_file is not None:
     df = pd.read_csv(uploaded_file)
+elif load_from_drive and drive_url.strip():
+    try:
+        with st.spinner("Google Driveから読み込み中..."):
+            df = load_csv_from_google_drive(drive_url.strip())
+        st.success("Google Driveから読み込みました。")
+    except Exception as e:
+        st.error(f"Google Driveの読み込みエラー: {e}")
+
+if df is not None:
 
     # サイドバーフィルター
     with st.sidebar:
@@ -316,7 +354,7 @@ if uploaded_file is not None:
             st.error(f"PDF生成エラー: {e}")
 
 else:
-    st.info("👆 CSVファイルをアップロードしてください。")
+    st.info("👆 CSVファイルをアップロードするか、Google Driveのリンクから読み込んでください。")
     st.markdown("""
     **対応カラム例：**
     | カラム名 | 内容 |
