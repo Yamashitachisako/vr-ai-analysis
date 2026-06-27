@@ -1,10 +1,16 @@
 import re
+import sys
+from pathlib import Path
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app.pdf_builder import build_pdf_bytes
 
 # ページ設定
 st.set_page_config(
@@ -80,6 +86,16 @@ st.markdown("""
     .st-key-load_from_drive_btn button[kind="primary"]:hover {
         background-color: #0056A6 !important;
         border-color: #0056A6 !important;
+        color: #ffffff !important;
+    }
+    .st-key-generate_pdf_btn button[kind="primary"] {
+        background-color: #28a745 !important;
+        color: #ffffff !important;
+        border: 1px solid #28a745 !important;
+    }
+    .st-key-generate_pdf_btn button[kind="primary"]:hover {
+        background-color: #218838 !important;
+        border-color: #218838 !important;
         color: #ffffff !important;
     }
 </style>
@@ -457,57 +473,39 @@ if df is not None:
 
     # ── PDFレポート生成 ──
     st.markdown('<div class="section-header">📄 PDFレポート生成</div>', unsafe_allow_html=True)
-    if st.button("📥 PDFレポートを生成", type="primary"):
+    if st.button(
+        "📥 PDFレポートを生成",
+        type="primary",
+        key="generate_pdf_btn",
+        use_container_width=True,
+    ):
         try:
-            from reportlab.lib.pagesizes import A4
-            from reportlab.lib import colors
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
-            import datetime
-
-            buf = BytesIO()
-            doc = SimpleDocTemplate(buf, pagesize=A4)
-            elements = []
-            styles = getSampleStyleSheet()
-
-            # タイトル
-            title_style = ParagraphStyle("title", fontSize=16, spaceAfter=12, fontName="Helvetica-Bold")
-            elements.append(Paragraph("VR Nursery Training Analysis Report", title_style))
-            elements.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
-            elements.append(Spacer(1, 12))
-
-            # 基本情報テーブル
-            summary_data = [
-                ["Item", "Value"],
-                ["Total Records", str(total_rows)],
-                ["Total Events", str(len(event_rows))],
-            ]
-            if "reaction_time" in filtered_df.columns:
-                avg_rt2 = filtered_df["reaction_time"].replace(0, pd.NA).dropna().mean()
-                summary_data.append(["Avg Reaction Time", f"{avg_rt2:.2f} sec" if pd.notna(avg_rt2) else "N/A"])
-
-            t = Table(summary_data, colWidths=[200, 200])
-            t.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4a90d9")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f0f4f8")]),
-            ]))
-            elements.append(t)
-
-            doc.build(elements)
-            buf.seek(0)
-            st.download_button(
-                label="⬇️ PDFをダウンロード",
-                data=buf,
-                file_name=f"vr_analysis_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf"
+            with st.spinner("PDFを生成中..."):
+                st.session_state.pdf_bytes = build_pdf_bytes(filtered_df)
+                st.session_state.pdf_error = None
+            st.success("PDFレポートを生成しました。下のボタンからダウンロードできます。")
+        except ImportError:
+            st.session_state.pdf_bytes = None
+            st.session_state.pdf_error = (
+                "reportlab がインストールされていません。"
+                "requirements.txt に reportlab を追加して再デプロイしてください。"
             )
         except Exception as e:
-            st.error(f"PDF生成エラー: {e}")
+            st.session_state.pdf_bytes = None
+            st.session_state.pdf_error = f"{type(e).__name__}: {e}"
+
+    if st.session_state.get("pdf_error"):
+        st.error(f"PDF生成エラー: {st.session_state.pdf_error}")
+
+    if st.session_state.get("pdf_bytes"):
+        st.download_button(
+            label="⬇️ PDFをダウンロード",
+            data=st.session_state.pdf_bytes,
+            file_name=f"vr_analysis_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_pdf_btn",
+        )
 
 else:
     st.info("👆 CSVファイルをアップロードするか、Google Driveのリンクから読み込んでください。")
