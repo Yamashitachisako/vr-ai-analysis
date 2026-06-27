@@ -25,6 +25,12 @@ VALID_PASSWORD = "test"
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = None
+if "pdf_error" not in st.session_state:
+    st.session_state.pdf_error = None
 
 if not st.session_state.authenticated:
     st.markdown("## ログイン")
@@ -203,6 +209,43 @@ def load_csv_from_google_drive(url: str) -> pd.DataFrame:
         content = response.read()
     return standardize_columns(read_csv_robust(content))
 
+def render_pdf_section(report_df: pd.DataFrame) -> None:
+    """df 読み込み後に必ず表示する PDF レポート生成セクション。"""
+    st.markdown('<div class="section-header">📄 PDFレポート生成</div>', unsafe_allow_html=True)
+    if st.button(
+        "📥 PDFレポートを生成",
+        type="primary",
+        key="generate_pdf_btn",
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("PDFを生成中..."):
+                st.session_state.pdf_bytes = build_pdf_bytes(report_df)
+                st.session_state.pdf_error = None
+            st.success("PDFレポートを生成しました。下のボタンからダウンロードできます。")
+        except ImportError:
+            st.session_state.pdf_bytes = None
+            st.session_state.pdf_error = (
+                "reportlab がインストールされていません。"
+                "requirements.txt に reportlab を追加して再デプロイしてください。"
+            )
+        except Exception as e:
+            st.session_state.pdf_bytes = None
+            st.session_state.pdf_error = f"{type(e).__name__}: {e}"
+
+    if st.session_state.get("pdf_error"):
+        st.error(f"PDF生成エラー: {st.session_state.pdf_error}")
+
+    if st.session_state.get("pdf_bytes"):
+        st.download_button(
+            label="⬇️ PDFをダウンロード",
+            data=st.session_state.pdf_bytes,
+            file_name=f"vr_analysis_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_pdf_btn",
+        )
+
 # ヘッダー
 st.markdown('<div class="main-title">🏥 VR保育研修 分析ダッシュボード</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">VRセッションデータのアップロードと分析</div>', unsafe_allow_html=True)
@@ -230,16 +273,22 @@ st.markdown("---")
 df = None
 if uploaded_file is not None:
     try:
-        df = load_csv_from_upload(uploaded_file)
+        st.session_state.df = load_csv_from_upload(uploaded_file)
+        st.session_state.pdf_bytes = None
+        st.session_state.pdf_error = None
     except Exception as e:
         st.error(f"CSVの読み込みエラー: {e}")
 elif load_from_drive and drive_url.strip():
     try:
         with st.spinner("Google Driveから読み込み中..."):
-            df = load_csv_from_google_drive(drive_url.strip())
+            st.session_state.df = load_csv_from_google_drive(drive_url.strip())
+        st.session_state.pdf_bytes = None
+        st.session_state.pdf_error = None
         st.success("Google Driveから読み込みました。")
     except Exception as e:
         st.error(f"Google Driveの読み込みエラー: {e}")
+
+df = st.session_state.df
 
 if df is not None:
 
@@ -310,6 +359,8 @@ if df is not None:
             st.metric("最短反応時間", f"{min_rt:.2f} 秒" if pd.notna(min_rt) else "N/A")
         else:
             st.metric("最短反応時間", "N/A")
+
+    render_pdf_section(filtered_df)
 
     # ── グラフ行1：反応時間推移 ＋ 事象別平均反応時間 ──
     st.markdown('<div class="section-header">📈 反応時間分析</div>', unsafe_allow_html=True)
@@ -470,42 +521,6 @@ if df is not None:
             )
             fig_data_value.update_layout(height=350)
             st.plotly_chart(fig_data_value, use_container_width=True)
-
-    # ── PDFレポート生成 ──
-    st.markdown('<div class="section-header">📄 PDFレポート生成</div>', unsafe_allow_html=True)
-    if st.button(
-        "📥 PDFレポートを生成",
-        type="primary",
-        key="generate_pdf_btn",
-        use_container_width=True,
-    ):
-        try:
-            with st.spinner("PDFを生成中..."):
-                st.session_state.pdf_bytes = build_pdf_bytes(filtered_df)
-                st.session_state.pdf_error = None
-            st.success("PDFレポートを生成しました。下のボタンからダウンロードできます。")
-        except ImportError:
-            st.session_state.pdf_bytes = None
-            st.session_state.pdf_error = (
-                "reportlab がインストールされていません。"
-                "requirements.txt に reportlab を追加して再デプロイしてください。"
-            )
-        except Exception as e:
-            st.session_state.pdf_bytes = None
-            st.session_state.pdf_error = f"{type(e).__name__}: {e}"
-
-    if st.session_state.get("pdf_error"):
-        st.error(f"PDF生成エラー: {st.session_state.pdf_error}")
-
-    if st.session_state.get("pdf_bytes"):
-        st.download_button(
-            label="⬇️ PDFをダウンロード",
-            data=st.session_state.pdf_bytes,
-            file_name=f"vr_analysis_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-            key="download_pdf_btn",
-        )
 
 else:
     st.info("👆 CSVファイルをアップロードするか、Google Driveのリンクから読み込んでください。")
