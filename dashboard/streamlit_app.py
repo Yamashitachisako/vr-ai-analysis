@@ -1,5 +1,6 @@
 import re
 import sys
+import logging
 from pathlib import Path
 
 import streamlit as st
@@ -10,6 +11,9 @@ from io import BytesIO
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ページ設定
 st.set_page_config(
@@ -30,6 +34,8 @@ if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = None
 if "pdf_error" not in st.session_state:
     st.session_state.pdf_error = None
+if "import_meta" not in st.session_state:
+    st.session_state.import_meta = None
 
 if not st.session_state.authenticated:
     st.markdown("## ログイン")
@@ -201,12 +207,45 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_csv_from_upload(uploaded_file) -> pd.DataFrame:
     return standardize_columns(read_csv_robust(uploaded_file.getvalue()))
 
-def load_csv_from_google_drive(url: str) -> pd.DataFrame:
+def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
+    """Drive URL から (content, file_id, modified_time) を返す。"""
+    file_id = extract_google_drive_file_id(url)
     download_url = to_google_drive_download_url(url)
-    request = Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(request, timeout=60) as response:
-        content = response.read()
+    from app.incremental_loader import download_drive_content
+
+    content, modified = download_drive_content(download_url)
+    return content, file_id, modified
+
+def load_csv_from_google_drive(url: str) -> pd.DataFrame:
+    content, _, _ = load_csv_bytes_from_google_drive(url)
     return standardize_columns(read_csv_robust(content))
+
+def apply_import_policy(
+    raw_df: pd.DataFrame,
+    *,
+    file_id: str,
+    file_name: str | None,
+    content: bytes | None,
+    modified_time: str | None,
+    mode: str,
+    start_date,
+    end_date,
+    date_column: str | None,
+) -> dict:
+    from app.incremental_loader import prepare_analysis_dataframe
+
+    return prepare_analysis_dataframe(
+        raw_df,
+        file_id=file_id,
+        file_name=file_name,
+        content=content,
+        modified_time=modified_time,
+        mode=mode,
+        start_date=start_date,
+        end_date=end_date,
+        date_column=date_column or None,
+        mark_imported=(mode == "new_only"),
+    )
 
 def render_pdf_section(report_df: pd.DataFrame) -> None:
     """グラフ表示の下に必ず表示する PDF レポート生成セクション。"""
@@ -258,6 +297,45 @@ with st.sidebar:
     st.image("https://img.icons8.com/color/96/virtual-reality.png", width=80)
     st.title("設定・フィルター")
     st.markdown("---")
+    st.markdown("### 📥 取り込み設定")
+    import_mode_label = st.radio(
+        "分析対象",
+        options=["新規追加分のみ", "期間指定", "全件（再分析）"],
+        index=0,
+        help="日付未指定時は新規追加分のみ。期間指定時はその期間のデータを抽出します。",
+    )
+    mode_map = {
+        "新規追加分のみ": "new_only",
+        "期間指定": "date_range",
+        "全件（再分析）": "all",
+    }
+    import_mode = mode_map[import_mode_label]
+
+    start_date = None
+    end_date = None
+    if import_mode == "date_range":
+        c1, c2 = st.columns(2)
+        start_date = c1.date_input("開始日")
+        end_date = c2.date_input("終了日")
+    else:
+        st.caption("期間指定モードにすると開始日・終了日を選べます。")
+
+    date_column_override = st.text_input(
+        "日付カラム名（任意）",
+        value="",
+        placeholder="例: Session_Date / timestamp",
+        help="空欄の場合は候補カラムを自動検出します。Elapsed_Time（経過秒）は日付として使いません。",
+    )
+
+    st.markdown("---")
+    if st.button("取り込み履歴をクリア", key="clear_history_btn"):
+        try:
+            from app.import_history import clear_history, get_connection
+
+            clear_history(get_connection())
+            st.success("取り込み履歴をクリアしました。")
+        except Exception as e:
+            st.error(f"履歴クリアエラー: {e}")
 
 # CSV読み込み（ログイン後・メインエリア上部に常時表示）
 st.markdown('<div class="section-header">📂 データ読み込み</div>', unsafe_allow_html=True)
@@ -273,27 +351,104 @@ load_from_drive = st.button(
 )
 st.markdown("---")
 
-df = None
 if uploaded_file is not None:
-    try:
-        st.session_state.df = load_csv_from_upload(uploaded_file)
-        st.session_state.pdf_bytes = None
-        st.session_state.pdf_error = None
-    except Exception as e:
-        st.error(f"CSVの読み込みエラー: {e}")
+    upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
+    if st.session_state.get("last_upload_key") != upload_key:
+        try:
+            raw = load_csv_from_upload(uploaded_file)
+            content = uploaded_file.getvalue()
+            file_id = f"upload:{uploaded_file.name}"
+            result = apply_import_policy(
+                raw,
+                file_id=file_id,
+                file_name=uploaded_file.name,
+                content=content,
+                modified_time=None,
+                mode=import_mode,
+                start_date=start_date,
+                end_date=end_date,
+                date_column=date_column_override.strip() or None,
+            )
+            st.session_state.df = result["df"]
+            st.session_state.import_meta = result
+            st.session_state.pdf_bytes = None
+            st.session_state.pdf_error = None
+            st.session_state.last_upload_key = upload_key
+            st.success(
+                f"アップロード完了: 全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
+                f"（モード: {result['mode']}）"
+            )
+            for note in result.get("notes") or []:
+                st.info(note)
+        except Exception as e:
+            st.error(f"CSVの読み込みエラー: {e}")
+            logger.exception("upload load failed")
 elif load_from_drive and drive_url.strip():
     try:
         with st.spinner("Google Driveから読み込み中..."):
-            st.session_state.df = load_csv_from_google_drive(drive_url.strip())
+            content, file_id, modified = load_csv_bytes_from_google_drive(drive_url.strip())
+            raw = standardize_columns(read_csv_robust(content))
+            result = apply_import_policy(
+                raw,
+                file_id=file_id,
+                file_name=file_id,
+                content=content,
+                modified_time=modified,
+                mode=import_mode,
+                start_date=start_date,
+                end_date=end_date,
+                date_column=date_column_override.strip() or None,
+            )
+        st.session_state.df = result["df"]
+        st.session_state.import_meta = result
         st.session_state.pdf_bytes = None
         st.session_state.pdf_error = None
-        st.success("Google Driveから読み込みました。")
+        st.session_state.last_upload_key = None
+        st.success(
+            f"Google Driveから読み込みました: 全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
+            f"（モード: {result['mode']}）"
+        )
+        if result.get("modified_time"):
+            st.caption(f"Drive Last-Modified: {result['modified_time']}")
+        for note in result.get("notes") or []:
+            st.info(note)
+        if result["selected_rows"] == 0:
+            st.warning(
+                "分析対象が 0 件です。すでに取り込み済みか、期間に該当するデータがありません。"
+                "「全件（再分析）」または期間指定を変更してください。"
+            )
     except Exception as e:
         st.error(f"Google Driveの読み込みエラー: {e}")
+        logger.exception("drive load failed")
 
 df = st.session_state.df
 
 if df is not None:
+    meta = st.session_state.get("import_meta") or {}
+    if meta:
+        st.caption(
+            f"取り込みモード: {meta.get('mode')} / "
+            f"元データ {meta.get('total_rows')} 行 → 表示中 {len(df)} 行"
+            + (f" / 日付カラム: {meta.get('date_column_used')}" if meta.get("date_column_used") else "")
+        )
+
+    # サイドバー：取り込み履歴
+    with st.sidebar:
+        st.markdown("### 🗂 取り込み履歴")
+        try:
+            from app.import_history import get_connection, list_import_runs
+
+            runs = list_import_runs(get_connection(), limit=10)
+            if runs:
+                for run in runs:
+                    st.caption(
+                        f"{run['created_at'][:19]} | {run['mode']} | "
+                        f"{run['rows_new']}/{run['rows_loaded']}行"
+                    )
+            else:
+                st.caption("履歴はまだありません。")
+        except Exception as e:
+            st.caption(f"履歴表示エラー: {e}")
 
     # サイドバーフィルター
     with st.sidebar:
