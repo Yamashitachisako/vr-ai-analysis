@@ -152,9 +152,32 @@ def test_load_vr_csvs_local_all_and_individual():
         assert result_one.selections[0].device_id == "C"
 
 
+def test_resolve_folder_always_fixed_id():
+    from app.vr_csv_loader import resolve_drive_folder_id
+    from app.drive_latest import DEFAULT_DRIVE_FOLDER_ID, LEGACY_SINGLE_FILE_ID
+
+    assert resolve_drive_folder_id(None) == DEFAULT_DRIVE_FOLDER_ID
+    assert resolve_drive_folder_id("") == DEFAULT_DRIVE_FOLDER_ID
+    assert (
+        resolve_drive_folder_id(
+            f"https://drive.google.com/file/d/{LEGACY_SINGLE_FILE_ID}/view"
+        )
+        == DEFAULT_DRIVE_FOLDER_ID
+    )
+    folder_url = f"https://drive.google.com/drive/folders/{DEFAULT_DRIVE_FOLDER_ID}"
+    assert resolve_drive_folder_id(folder_url) == DEFAULT_DRIVE_FOLDER_ID
+    # 別フォルダURLでも必ず固定 folderId を使う
+    other = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    assert (
+        resolve_drive_folder_id(f"https://drive.google.com/drive/folders/{other}")
+        == DEFAULT_DRIVE_FOLDER_ID
+    )
+
+
 if __name__ == "__main__":
     test_prepare_keeps_headers()
     test_infer_device_from_player_id()
     test_select_latest_per_device_by_modified_time()
     test_load_vr_csvs_local_all_and_individual()
+    test_resolve_folder_always_fixed_id()
     print("OK: all vr_csv_loader tests passed")

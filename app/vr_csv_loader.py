@@ -16,6 +16,8 @@ from typing import Any
 import pandas as pd
 
 from app.drive_latest import (
+    DEFAULT_DRIVE_FOLDER_ID,
+    LEGACY_SINGLE_FILE_ID,
     CsvFileInfo,
     download_drive_file,
     extract_drive_file_id,
@@ -24,7 +26,6 @@ from app.drive_latest import (
     list_drive_folder_csvs,
     list_local_csvs,
     log_latest_csv_selection,
-    pick_latest_csv,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,40 @@ def infer_device_id(file_info: CsvFileInfo, df: pd.DataFrame) -> str:
     return "UNKNOWN"
 
 
+def resolve_drive_folder_id(drive_url: str | None) -> str:
+    """常に親フォルダ DEFAULT_DRIVE_FOLDER_ID を返す。
+
+    単体ファイルURL・他フォルダURL・空欄いずれでも、
+    fileId 固定読み込みはせず folderId=1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9 を使う。
+    """
+    url = (drive_url or "").strip()
+    if url:
+        if is_folder_url(url):
+            parsed = extract_drive_folder_id(url)
+            if parsed and parsed != DEFAULT_DRIVE_FOLDER_ID:
+                logger.warning(
+                    "folder URL folderId=%s は無視し、固定の folderId=%s を使います。",
+                    parsed,
+                    DEFAULT_DRIVE_FOLDER_ID,
+                )
+            elif parsed == DEFAULT_DRIVE_FOLDER_ID:
+                logger.info("using configured folderId=%s", DEFAULT_DRIVE_FOLDER_ID)
+        else:
+            file_id = extract_drive_file_id(url)
+            logger.warning(
+                "file URL/fileId=%s は固定読み込みしません。"
+                "親フォルダ folderId=%s 内のCSV一覧を毎回再取得します。",
+                file_id or url,
+                DEFAULT_DRIVE_FOLDER_ID,
+            )
+    else:
+        logger.info(
+            "drive URL empty; using fixed folderId=%s",
+            DEFAULT_DRIVE_FOLDER_ID,
+        )
+    return DEFAULT_DRIVE_FOLDER_ID
+
+
 def list_candidate_csvs(
     *,
     drive_url: str | None,
@@ -140,49 +175,31 @@ def list_candidate_csvs(
     prefer_local: bool,
     local_dir: Path | str | None,
 ) -> list[CsvFileInfo]:
-    """毎回CSV一覧を再取得する。"""
-    url = (drive_url or "").strip()
-
+    """毎回 folderId=DEFAULT_DRIVE_FOLDER_ID のCSV一覧を再取得する。"""
     if prefer_local and local_dir:
         files = list_local_csvs(local_dir)
         if files:
             logger.info("re-listed %s local csv files", len(files))
             return files
 
-    if url and is_folder_url(url):
-        folder_id = extract_drive_folder_id(url)
-        if not folder_id:
-            raise ValueError("Google DriveフォルダIDを抽出できませんでした。")
-        files = list_drive_folder_csvs(folder_id, api_key=api_key)
-        logger.info("re-listed %s drive folder csv files", len(files))
-        return files
-
-    if url:
-        file_id = extract_drive_file_id(url)
-        if not file_id:
-            raise ValueError("Google DriveファイルIDを抽出できませんでした。")
-        content, modified = download_drive_file(file_id)
-        # 単一ファイルでも一覧として扱う（後で端末判定）
-        info = CsvFileInfo(
-            file_id=file_id,
-            name=f"{file_id}.csv",
-            modified_time=modified,
-            source="drive",
-        )
-        # content は呼び出し側で再DLする（状態を持たない）
-        logger.info("re-listed single drive file id=%s modified=%s", file_id, modified)
-        return [info]
-
-    if local_dir:
-        files = list_local_csvs(local_dir)
-        if files:
-            return files
-
-    raise FileNotFoundError(
-        "CSV一覧を取得できませんでした。"
-        "Google DriveのフォルダURLを指定するか、data/input にCSVを配置してください。"
+    folder_id = resolve_drive_folder_id(drive_url)
+    assert folder_id == DEFAULT_DRIVE_FOLDER_ID
+    files = list_drive_folder_csvs(folder_id, api_key=api_key)
+    # modifiedTime が取れている候補をログ
+    ranked = sorted(files, key=lambda f: f.sort_key, reverse=True)
+    logger.info(
+        "re-listed %s drive folder csv files from folderId=%s (latest modifiedTime=%s name=%s fileId=%s)",
+        len(files),
+        folder_id,
+        ranked[0].modified_time if ranked else None,
+        ranked[0].name if ranked else None,
+        ranked[0].file_id if ranked else None,
     )
-
+    if not files:
+        raise FileNotFoundError(
+            f"フォルダ（folderId={folder_id}）内にCSVが見つかりませんでした。"
+        )
+    return files
 
 def _load_file_content(info: CsvFileInfo) -> tuple[bytes, str | None]:
     if info.source == "local" and info.path:

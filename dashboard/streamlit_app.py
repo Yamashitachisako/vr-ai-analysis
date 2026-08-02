@@ -117,9 +117,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DEFAULT_DRIVE_CSV_URL = (
-    "https://drive.google.com/file/d/10s13cnRpNdIpdR4Gaeez5sCaewonj1a9/view?usp=sharing"
-)
+from app.drive_latest import DEFAULT_DRIVE_FOLDER_URL
+
+# 単体CSVファイルは使わない。親フォルダ内を毎回一覧取得する。
+DEFAULT_DRIVE_CSV_URL = DEFAULT_DRIVE_FOLDER_URL
 
 def reset_load_state() -> None:
     """アップロード／Drive取得前に前回の選択・キャッシュをクリアする。"""
@@ -299,12 +300,15 @@ def load_vr_csv_bundle(
     }
 
 def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
-    """互換用: 単一ファイルURLから取得。"""
-    from app.drive_latest import download_drive_file, extract_drive_file_id
+    """互換用: 単体URLでも親フォルダから modifiedTime 最新CSVを取得。"""
+    from app.drive_latest import resolve_latest_csv_from_source
 
-    file_id = extract_drive_file_id(url) or url.strip()
-    content, modified = download_drive_file(file_id)
-    return content, file_id, modified
+    info, content, _ = resolve_latest_csv_from_source(
+        drive_url=url,
+        api_key=get_google_api_key(),
+        prefer_local=False,
+    )
+    return content, info.file_id, info.modified_time
 
 def load_csv_from_google_drive(url: str) -> pd.DataFrame:
     content, _, _ = load_csv_bytes_from_google_drive(url)
@@ -493,9 +497,16 @@ load_from_upload = st.button(
 
 st.markdown("**Google Drive / ローカルからCSVを取り込む**")
 drive_url = st.text_input(
-    "Google DriveのフォルダまたはファイルURL",
+    "Google DriveのフォルダURL",
     value=DEFAULT_DRIVE_CSV_URL,
-    help="4台分を扱う場合はフォルダURLを指定してください。ファイルURLは単一CSVとして扱います。",
+    help=(
+        "常に folderId=1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9 内のCSV一覧を再取得し、"
+        "modifiedTimeが最新のものを使います。単体ファイルURLは使いません。"
+    ),
+)
+st.caption(
+    "固定参照フォルダ: `1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9` ／ "
+    "単体 fileId の固定読み込みはしません"
 )
 api_key_input = st.text_input(
     "Google API Key（任意・フォルダ一覧用）",
@@ -767,9 +778,10 @@ else:
     **取り込みルール：**
     - **全員** → VR各端末の最新CSVを1つずつ取得して統合（全体で1ファイルではない）
     - **個人** → 選択した個人 / VR端末の最新CSVのみ
+    - **親フォルダ**内のCSV一覧を毎回再取得（既定: `1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9`）
+    - 単体ファイルURL（例: `10s13cnRpNdIpdR4Gaeez5sCaewonj1a9`）は固定読み込みしない
     - 最新判定はファイル名ではなく Google Drive の **modifiedTime**
     - 可視化・表・集計の項目名は CSV ヘッダー行どおり
       （`Elapsed_Time`, `Event_Type`, `Player_ID`, `Target_Object`, `Data_Value`,
       `WorldX`, `WorldY`, `WorldZ`, `LocalX`, `LocalY`, `LocalZ`）
-    - フォルダURL推奨（4台分のCSV一覧取得）。ファイルURLは単一CSVとして扱う
     """)

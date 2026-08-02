@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 LOCAL_CSV_DIR = Path(__file__).resolve().parent.parent / "data" / "input"
 
+# VR端末CSVが上がる親フォルダ（単体ファイルIDは使わない）
+DEFAULT_DRIVE_FOLDER_ID = "1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9"
+DEFAULT_DRIVE_FOLDER_URL = (
+    f"https://drive.google.com/drive/folders/{DEFAULT_DRIVE_FOLDER_ID}"
+)
+# 以前のサンプル単体ファイル。固定読み込み禁止。
+LEGACY_SINGLE_FILE_ID = "10s13cnRpNdIpdR4Gaeez5sCaewonj1a9"
+
 
 @dataclass
 class CsvFileInfo:
@@ -328,7 +336,8 @@ def resolve_latest_csv_from_source(
     prefer_local: bool = False,
 ) -> tuple[CsvFileInfo, bytes, list[CsvFileInfo]]:
     """
-    ボタン押下ごとに一覧を再取得し、最新CSVだけを返す。
+    ボタン押下ごとに親フォルダのCSV一覧を再取得し、modifiedTime最新だけを返す。
+    単体ファイルIDの固定読み込みはしない。
     戻り値: (file_info, content_bytes, candidates)
     """
     url = (drive_url or "").strip()
@@ -341,44 +350,38 @@ def resolve_latest_csv_from_source(
             content = Path(latest.path).read_bytes()  # type: ignore[arg-type]
             return latest, content, candidates
 
+    folder_id = DEFAULT_DRIVE_FOLDER_ID
     if url and is_folder_url(url):
-        folder_id = extract_drive_folder_id(url)
-        if not folder_id:
-            raise ValueError("Google DriveフォルダIDをURLから抽出できませんでした。")
-        candidates = list_drive_folder_csvs(folder_id, api_key=api_key)
-        latest = pick_latest_csv(candidates)
-        content, header_modified = download_drive_file(latest.file_id)
-        if not latest.modified_time and header_modified:
-            latest.modified_time = header_modified
-            log_latest_csv_selection(latest, candidates)
-        return latest, content, candidates
-
-    if url:
+        parsed = extract_drive_folder_id(url)
+        if parsed and parsed != DEFAULT_DRIVE_FOLDER_ID:
+            logger.warning(
+                "ignoring other folderId=%s; always use folderId=%s",
+                parsed,
+                DEFAULT_DRIVE_FOLDER_ID,
+            )
+    elif url:
         file_id = extract_drive_file_id(url)
-        if not file_id:
-            raise ValueError("Google DriveファイルIDをURLから抽出できませんでした。")
-        content, header_modified = download_drive_file(file_id)
-        info = CsvFileInfo(
-            file_id=file_id,
-            name=f"{file_id}.csv",
-            modified_time=header_modified,
-            source="drive",
+        logger.warning(
+            "single file URL/fileId=%s is not used as fixed source; "
+            "listing fixed folderId=%s instead",
+            file_id,
+            DEFAULT_DRIVE_FOLDER_ID,
         )
-        candidates = [info]
-        log_latest_csv_selection(info, candidates)
-        return info, content, candidates
 
-    if local_dir:
-        candidates = list_local_csvs(local_dir)
-        if candidates:
-            latest = pick_latest_csv(candidates)
-            content = Path(latest.path).read_bytes()  # type: ignore[arg-type]
-            return latest, content, candidates
-
-    raise FileNotFoundError(
-        "最新CSVが見つかりませんでした。"
-        "Google Driveのフォルダ/ファイルURLを指定するか、data/input にCSVを配置してください。"
+    candidates = list_drive_folder_csvs(folder_id, api_key=api_key)
+    latest = pick_latest_csv(candidates)
+    content, header_modified = download_drive_file(latest.file_id)
+    if not latest.modified_time and header_modified:
+        latest.modified_time = header_modified
+    log_latest_csv_selection(latest, candidates)
+    logger.info(
+        "resolve_latest_csv folderId=%s selected=%s fileId=%s modifiedTime=%s",
+        folder_id,
+        latest.name,
+        latest.file_id,
+        latest.modified_time,
     )
+    return latest, content, candidates
 
 
 def pick_latest_uploaded(files: list[Any]) -> Any:
