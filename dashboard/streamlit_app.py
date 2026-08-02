@@ -1,4 +1,3 @@
-import re
 import sys
 import os
 import logging
@@ -6,10 +5,7 @@ from pathlib import Path
 
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 from io import BytesIO
-from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -37,6 +33,14 @@ if "pdf_error" not in st.session_state:
     st.session_state.pdf_error = None
 if "import_meta" not in st.session_state:
     st.session_state.import_meta = None
+if "vr_selection_sig" not in st.session_state:
+    st.session_state.vr_selection_sig = None
+if "force_csv_reload" not in st.session_state:
+    st.session_state.force_csv_reload = False
+if "available_devices" not in st.session_state:
+    st.session_state.available_devices = ["A", "B", "C", "D"]
+if "had_successful_load" not in st.session_state:
+    st.session_state.had_successful_load = False
 
 if not st.session_state.authenticated:
     st.markdown("## ログイン")
@@ -113,21 +117,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 事象別カラー定義
-EVENT_COLORS = {
-    "誤嚥": "#e74c3c",
-    "誤飲": "#c0392b",
-    "転倒": "#e67e22",
-    "転落": "#d35400",
-    "噛みつき": "#9b59b6",
-    "窒息": "#8e44ad",
-    "アレルギー": "#f39c12",
-    "None": "#bdc3c7",
-}
-
-def get_event_color(event_type):
-    return EVENT_COLORS.get(str(event_type), "#3498db")
-
 DEFAULT_DRIVE_CSV_URL = (
     "https://drive.google.com/file/d/10s13cnRpNdIpdR4Gaeez5sCaewonj1a9/view?usp=sharing"
 )
@@ -140,7 +129,8 @@ def reset_load_state() -> None:
     st.session_state.pdf_error = None
     st.session_state.last_upload_key = None
     st.session_state.latest_csv_info = None
-    logger.info("load state reset before fetching latest CSV")
+    st.session_state.vr_load_result = None
+    logger.info("load state reset before fetching CSV (clear cache / previous analysis)")
 
 
 def get_google_api_key() -> str | None:
@@ -190,67 +180,122 @@ def read_csv_robust(content: bytes) -> pd.DataFrame:
 
     raise ValueError(f"CSVの読み込みに失敗しました: {last_error}")
 
-def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """CSVカラム名をアプリ標準名に統一する。"""
-    df = df.copy()
-    df.columns = df.columns.str.strip()
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """実CSVヘッダー名を維持したまま型を整える（リネームしない）。"""
+    from app.vr_csv_loader import prepare_vr_dataframe
 
-    direct_rename = {
-        "Elapsed_Time": "timestamp",
-        "Event_Type": "event_type",
-        "Player_ID": "player_id",
-    }
-    df = df.rename(columns={k: v for k, v in direct_rename.items() if k in df.columns})
-
-    if "Target_Object" in df.columns:
-        if "location" not in df.columns:
-            df["location"] = df["Target_Object"]
-        if "target_object" not in df.columns:
-            df["target_object"] = df["Target_Object"]
-
-    if "Data_Value" in df.columns:
-        df["data_value"] = pd.to_numeric(df["Data_Value"], errors="coerce")
-        if "reaction_time" not in df.columns:
-            df["reaction_time"] = df["data_value"]
-
-    if "WorldX" in df.columns and "gaze_x" not in df.columns:
-        df["gaze_x"] = pd.to_numeric(df["WorldX"], errors="coerce")
-    if "WorldY" in df.columns and "gaze_y" not in df.columns:
-        df["gaze_y"] = pd.to_numeric(df["WorldY"], errors="coerce")
-
-    if "reaction_time" in df.columns:
-        df["reaction_time"] = pd.to_numeric(df["reaction_time"], errors="coerce")
-    if "data_value" not in df.columns and "reaction_time" in df.columns:
-        df["data_value"] = df["reaction_time"]
-
-    return df
+    return prepare_vr_dataframe(df)
 
 def load_csv_from_upload(uploaded_file) -> pd.DataFrame:
-    return standardize_columns(read_csv_robust(uploaded_file.getvalue()))
+    return prepare_dataframe(read_csv_robust(uploaded_file.getvalue()))
 
-def load_latest_csv_for_analysis(
+def format_vr_usage_log(
+    *,
+    mode: str,
+    selected_device: str | None,
+    selections: list,
+    record_count: int,
+    chart_record_count: int | None = None,
+) -> str:
+    mode_label = "全員（端末ごと最新を統合）" if mode == "all" else "個人"
+    lines = [
+        "[分析に使用したCSV]",
+        f"  選択モード: {mode_label}",
+        f"  選択端末/個人: {selected_device or '(全員)'}",
+        f"  使用ファイル数: {len(selections)}",
+        f"  グラフ作成用レコード件数: {chart_record_count if chart_record_count is not None else record_count}",
+    ]
+    for s in selections:
+        lines.append(
+            f"  - device={s.device_id} | name={s.file.name} | fileId={s.file.file_id} | "
+            f"modifiedTime={s.file.modified_time or '-'} | records={s.record_count}"
+        )
+    return "\n".join(lines)
+
+
+def apply_import_policy_for_selections(
+    selections: list,
+    *,
+    import_mode: str,
+    start_date,
+    end_date,
+    date_column: str | None,
+) -> dict:
+    """端末ごとの最新CSVに取り込みポリシーを適用してから結合する。"""
+    frames = []
+    notes: list[str] = []
+    total_rows = 0
+    selected_rows = 0
+    date_column_used = None
+    result_mode = import_mode
+
+    for sel in selections:
+        result = apply_import_policy(
+            sel.df,
+            file_id=sel.file.file_id,
+            file_name=sel.file.name,
+            content=None,
+            modified_time=sel.file.modified_time,
+            mode=import_mode,
+            start_date=start_date,
+            end_date=end_date,
+            date_column=date_column,
+        )
+        frames.append(result["df"])
+        total_rows += int(result["total_rows"])
+        selected_rows += int(result["selected_rows"])
+        result_mode = result["mode"]
+        if result.get("date_column_used"):
+            date_column_used = result["date_column_used"]
+        for n in result.get("notes") or []:
+            notes.append(f"[{sel.device_id}/{sel.file.name}] {n}")
+
+    if not frames:
+        merged = pd.DataFrame()
+    else:
+        merged = pd.concat(frames, ignore_index=True)
+
+    return {
+        "df": merged,
+        "mode": result_mode,
+        "total_rows": total_rows,
+        "selected_rows": selected_rows,
+        "date_column_used": date_column_used,
+        "notes": notes,
+        "content_hash": None,
+        "modified_time": None,
+    }
+
+
+def load_vr_csv_bundle(
     *,
     drive_url: str,
     api_key: str | None,
+    analysis_mode: str,
+    selected_device: str | None,
     prefer_local: bool = False,
 ) -> dict:
-    """毎回一覧を再取得し、最新CSVのみを読み込む。"""
-    from app.drive_latest import format_csv_selection_log, resolve_latest_csv_from_source
+    """毎回一覧を再取得し、全員=端末ごと最新統合 / 個人=選択端末の最新のみ。"""
+    from app.vr_csv_loader import load_vr_csvs_for_mode
 
-    info, content, candidates = resolve_latest_csv_from_source(
+    result = load_vr_csvs_for_mode(
         drive_url=drive_url,
         api_key=api_key,
+        mode=analysis_mode,
+        selected_device=selected_device,
         prefer_local=prefer_local,
     )
-    selection_log = format_csv_selection_log(info, candidates)
-    logger.info("load_latest_csv_for_analysis selected=%s modified=%s", info.name, info.modified_time)
-    raw = standardize_columns(read_csv_robust(content))
+    usage_log = format_vr_usage_log(
+        mode=result.mode,
+        selected_device=result.selected_device,
+        selections=result.selections,
+        record_count=result.record_count,
+    )
+    logger.info(usage_log)
     return {
-        "info": info,
-        "content": content,
-        "raw": raw,
-        "candidates": candidates,
-        "selection_log": selection_log,
+        "result": result,
+        "usage_log": usage_log,
+        "selection_log": result.selection_log,
     }
 
 def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
@@ -263,7 +308,7 @@ def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
 
 def load_csv_from_google_drive(url: str) -> pd.DataFrame:
     content, _, _ = load_csv_bytes_from_google_drive(url)
-    return standardize_columns(read_csv_robust(content))
+    return prepare_dataframe(read_csv_robust(content))
 
 def apply_import_policy(
     raw_df: pd.DataFrame,
@@ -342,9 +387,53 @@ with st.sidebar:
     st.image("https://img.icons8.com/color/96/virtual-reality.png", width=80)
     st.title("設定・フィルター")
     st.markdown("---")
+    st.markdown("### 👥 分析対象（CSV選択）")
+    scope_label = st.radio(
+        "全員 / 個人",
+        options=["全員", "個人"],
+        index=0,
+        help="全員: VR各端末の最新CSVを1つずつ取得して統合。個人: 選択端末の最新CSVのみ。",
+        key="analysis_scope_radio",
+    )
+    analysis_mode = "all" if scope_label == "全員" else "individual"
+    selected_device = None
+    if analysis_mode == "individual":
+        device_options = sorted(set(st.session_state.available_devices + ["A", "B", "C", "D"]))
+        selected_device = st.selectbox(
+            "個人 / VR端末（Player_ID）",
+            options=device_options,
+            key="selected_device_box",
+        )
+        custom_device = st.text_input(
+            "上記にない場合は手入力",
+            value="",
+            placeholder="例: Player1 / A",
+            key="custom_device_input",
+        )
+        if custom_device.strip():
+            selected_device = custom_device.strip()
+
+    selection_sig = (analysis_mode, selected_device)
+    prev_sig = st.session_state.get("vr_selection_sig")
+    if prev_sig is not None and prev_sig != selection_sig:
+        had_data = bool(st.session_state.get("had_successful_load"))
+        logger.info(
+            "CSV selection changed: %s -> %s ; clear cache%s",
+            prev_sig,
+            selection_sig,
+            " and force reload" if had_data else "",
+        )
+        reset_load_state()
+        st.session_state.had_successful_load = False
+        # 前回読み込み済みなら、選択変更時に必ず再取得して再描画する
+        if had_data:
+            st.session_state.force_csv_reload = True
+    st.session_state.vr_selection_sig = selection_sig
+
+    st.markdown("---")
     st.markdown("### 📥 取り込み設定")
     import_mode_label = st.radio(
-        "分析対象",
+        "分析対象行",
         options=["新規追加分のみ", "期間指定", "全件（再分析）"],
         index=0,
         help="日付未指定時は新規追加分のみ。期間指定時はその期間のデータを抽出します。",
@@ -368,7 +457,7 @@ with st.sidebar:
     date_column_override = st.text_input(
         "日付カラム名（任意）",
         value="",
-        placeholder="例: Session_Date / timestamp",
+        placeholder="例: Session_Date",
         help="空欄の場合は候補カラムを自動検出します。Elapsed_Time（経過秒）は日付として使いません。",
     )
 
@@ -382,30 +471,31 @@ with st.sidebar:
         except Exception as e:
             st.error(f"履歴クリアエラー: {e}")
 
-# CSV読み込み（ログイン後・メインエリア上部に常時表示）
+# CSV読み込み
 st.markdown('<div class="section-header">📂 データ読み込み</div>', unsafe_allow_html=True)
 st.caption(
-    "「取り込む」ボタンを押すたびにCSV一覧を再取得し、"
-    "**最終更新日時が最も新しいCSVだけ**を分析対象にします。"
+    "ボタン押下のたびに Google Drive の CSV 一覧を再取得します。"
+    "最新判定はファイル名ではなく **modifiedTime** です。"
+    "「全員」= 各VR端末の最新CSVを統合 / 「個人」= 選択端末の最新CSVのみ。"
 )
 
 uploaded_files = st.file_uploader(
-    "CSVをアップロード（複数可・最新のみ使用）",
+    "CSVをアップロード（複数可・端末ごとに最新を使用）",
     type=["csv"],
     accept_multiple_files=True,
     key="csv_uploader",
 )
 load_from_upload = st.button(
-    "アップロードした最新CSVを取り込む",
+    "アップロードCSVを取り込む",
     use_container_width=True,
     key="load_from_upload_btn",
 )
 
-st.markdown("**Google Drive / ローカルから最新CSVを取り込む**")
+st.markdown("**Google Drive / ローカルからCSVを取り込む**")
 drive_url = st.text_input(
     "Google DriveのフォルダまたはファイルURL",
     value=DEFAULT_DRIVE_CSV_URL,
-    help="フォルダURLなら中の最新CSVを自動選択。ファイルURLならそのファイルを毎回新規取得します。",
+    help="4台分を扱う場合はフォルダURLを指定してください。ファイルURLは単一CSVとして扱います。",
 )
 api_key_input = st.text_input(
     "Google API Key（任意・フォルダ一覧用）",
@@ -413,7 +503,7 @@ api_key_input = st.text_input(
     type="password",
     help="フォルダ内のCSV一覧取得に使います。未設定でも公開フォルダの取得を試みます。",
 )
-prefer_local = st.checkbox("ローカル data/input の最新CSVを優先する", value=False)
+prefer_local = st.checkbox("ローカル data/input のCSVを優先する", value=False)
 load_from_drive = st.button(
     "最新CSVを取り込む",
     type="primary",
@@ -422,123 +512,180 @@ load_from_drive = st.button(
 )
 st.markdown("---")
 
+do_drive_load = load_from_drive or st.session_state.get("force_csv_reload", False)
+
 if load_from_upload:
     try:
         reset_load_state()
         if not uploaded_files:
             raise FileNotFoundError("CSVが選択されていません。ファイルを選んでから再度ボタンを押してください。")
-        from app.drive_latest import CsvFileInfo, format_csv_selection_log, pick_latest_uploaded
-
-        latest_upload = pick_latest_uploaded(uploaded_files)
-        content = latest_upload.getvalue()
-        raw = load_csv_from_upload(latest_upload)
-        selected_info = CsvFileInfo(
-            file_id=f"upload:{latest_upload.name}",
-            name=latest_upload.name,
-            modified_time=None,
-            source="upload",
+        from app.drive_latest import CsvFileInfo
+        from app.vr_csv_loader import (
+            DeviceCsvSelection,
+            build_analysis_frame,
+            infer_device_id,
+            prepare_vr_dataframe,
         )
-        candidate_infos = [
-            CsvFileInfo(file_id=f"upload:{f.name}", name=f.name, source="upload")
-            for f in uploaded_files
-        ]
-        selection_log = format_csv_selection_log(selected_info, candidate_infos)
-        for line in selection_log.splitlines():
-            logger.info(line)
-        result = apply_import_policy(
-            raw,
-            file_id=f"upload:{latest_upload.name}",
-            file_name=latest_upload.name,
-            content=content,
-            modified_time=None,
-            mode=import_mode,
+
+        by_device = {}
+        for idx, uploaded in enumerate(uploaded_files):
+            raw = prepare_vr_dataframe(read_csv_robust(uploaded.getvalue()))
+            info = CsvFileInfo(
+                file_id=f"upload:{uploaded.name}:{idx}",
+                name=uploaded.name,
+                modified_time=None,
+                source="upload",
+            )
+            device_id = infer_device_id(info, raw)
+            by_device.setdefault(device_id, []).append((info, raw))
+
+        selections_map = {}
+        for device_id, items in by_device.items():
+            best_info, best_df = items[-1]
+            selections_map[device_id] = DeviceCsvSelection(
+                device_id=device_id,
+                file=best_info,
+                df=best_df,
+                record_count=len(best_df),
+            )
+
+        st.session_state.available_devices = sorted(selections_map.keys())
+        used = list(selections_map.values())
+        if analysis_mode == "individual" and selected_device:
+            if selected_device not in selections_map:
+                available = ", ".join(sorted(selections_map.keys())) or "(なし)"
+                raise ValueError(
+                    f"選択された端末「{selected_device}」のCSVが見つかりません。利用可能: {available}"
+                )
+            used = [selections_map[selected_device]]
+        elif analysis_mode == "all":
+            used = list(selections_map.values())
+
+        result = apply_import_policy_for_selections(
+            used,
+            import_mode=import_mode,
             start_date=start_date,
             end_date=end_date,
             date_column=date_column_override.strip() or None,
         )
+        usage_log = format_vr_usage_log(
+            mode=analysis_mode,
+            selected_device=selected_device,
+            selections=used,
+            record_count=result["selected_rows"],
+        )
+        logger.info(usage_log)
         st.session_state.df = result["df"]
+        st.session_state.had_successful_load = True
         st.session_state.import_meta = {
             **result,
-            "source_name": latest_upload.name,
+            "source_name": ", ".join(s.file.name for s in used),
             "candidates": len(uploaded_files),
-            "selection_log": selection_log,
+            "selection_log": usage_log,
+            "usage_log": usage_log,
+            "analysis_mode": analysis_mode,
+            "selected_device": selected_device,
+            "files": [
+                {
+                    "device": s.device_id,
+                    "name": s.file.name,
+                    "file_id": s.file.file_id,
+                    "modified_time": s.file.modified_time,
+                    "records": s.record_count,
+                }
+                for s in used
+            ],
         }
         st.session_state.latest_csv_info = {
-            "name": latest_upload.name,
-            "file_id": f"upload:{latest_upload.name}",
+            "name": st.session_state.import_meta["source_name"],
+            "file_id": ",".join(s.file.file_id for s in used),
             "modified_time": None,
-            "created_time": None,
             "source": "upload",
         }
         st.success(
-            f"アップロード完了（最新のみ）: {latest_upload.name} ／ "
-            f"候補{len(uploaded_files)}件中1件 ／ "
+            f"アップロード完了（モード: {scope_label}）／ "
+            f"使用ファイル {len(used)} 件／ "
             f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
         )
-        st.info(
-            f"選択された最新CSV: **{latest_upload.name}** ／ "
-            f"更新日時: （ブラウザアップロードのためファイル名の日付で判定）"
-        )
-        with st.expander("最新CSV選定ログ", expanded=True):
-            st.code(selection_log)
+        with st.expander("使用CSVログ", expanded=True):
+            st.code(usage_log)
         for note in result.get("notes") or []:
             st.info(note)
     except Exception as e:
         st.error(f"CSVの読み込みエラー: {e}")
         logger.exception("upload load failed")
 
-elif load_from_drive:
+elif do_drive_load:
     try:
+        st.session_state.force_csv_reload = False
         reset_load_state()
-        with st.spinner("最新CSVを検索・取得中..."):
+        with st.spinner("CSV一覧を再取得し、端末ごとの最新ファイルを選定中..."):
             api_key = (api_key_input or "").strip() or get_google_api_key()
-            loaded = load_latest_csv_for_analysis(
+            loaded = load_vr_csv_bundle(
                 drive_url=drive_url.strip(),
                 api_key=api_key,
+                analysis_mode=analysis_mode,
+                selected_device=selected_device,
                 prefer_local=prefer_local,
             )
-            info = loaded["info"]
-            content = loaded["content"]
-            raw = loaded["raw"]
+            vr_result = loaded["result"]
             selection_log = loaded.get("selection_log") or ""
-            result = apply_import_policy(
-                raw,
-                file_id=info.file_id,
-                file_name=info.name,
-                content=content,
-                modified_time=info.modified_time,
-                mode=import_mode,
+            usage_log = loaded.get("usage_log") or ""
+            st.session_state.available_devices = sorted(
+                {s.device_id for s in vr_result.selections}
+                | set(st.session_state.available_devices)
+            )
+            result = apply_import_policy_for_selections(
+                vr_result.selections,
+                import_mode=import_mode,
                 start_date=start_date,
                 end_date=end_date,
                 date_column=date_column_override.strip() or None,
             )
+            usage_log = format_vr_usage_log(
+                mode=analysis_mode,
+                selected_device=selected_device,
+                selections=vr_result.selections,
+                record_count=result["selected_rows"],
+            )
+            logger.info(usage_log)
+            for line in (selection_log or "").splitlines():
+                logger.info(line)
         st.session_state.df = result["df"]
+        st.session_state.had_successful_load = True
         st.session_state.import_meta = {
             **result,
-            "source_name": info.name,
-            "source": info.source,
-            "file_id": info.file_id,
-            "selection_log": selection_log,
+            "source_name": ", ".join(s.file.name for s in vr_result.selections),
+            "selection_log": selection_log + "\n\n" + usage_log,
+            "usage_log": usage_log,
+            "analysis_mode": analysis_mode,
+            "selected_device": selected_device,
+            "files": [
+                {
+                    "device": s.device_id,
+                    "name": s.file.name,
+                    "file_id": s.file.file_id,
+                    "modified_time": s.file.modified_time,
+                    "records": s.record_count,
+                }
+                for s in vr_result.selections
+            ],
         }
+        first = vr_result.selections[0] if vr_result.selections else None
         st.session_state.latest_csv_info = {
-            "name": info.name,
-            "file_id": info.file_id,
-            "modified_time": info.modified_time,
-            "created_time": info.created_time,
-            "source": info.source,
+            "name": st.session_state.import_meta["source_name"],
+            "file_id": ",".join(s.file.file_id for s in vr_result.selections),
+            "modified_time": ", ".join(s.file.modified_time or "-" for s in vr_result.selections),
+            "source": first.file.source if first else "drive",
         }
         st.success(
-            f"最新CSVを取り込みました: **{info.name}** ／ "
+            f"取り込み完了（モード: {scope_label}"
+            + (f" / 端末: {selected_device}" if selected_device else "")
+            + f"）／ 使用ファイル {len(vr_result.selections)} 件／ "
             f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
-            f"（モード: {result['mode']}）"
         )
-        st.info(
-            f"選択された最新CSV: **{info.name}** ／ "
-            f"更新日時(modifiedTime): **{info.modified_time or '(不明)'}** ／ "
-            f"作成日時: {info.created_time or '(不明)'}"
-        )
-        with st.expander("最新CSV選定ログ", expanded=True):
-            st.code(selection_log or f"選択: {info.name} / modified={info.modified_time}")
+        with st.expander("使用CSV・選定ログ", expanded=True):
+            st.code((selection_log or "") + "\n\n" + usage_log)
         for note in result.get("notes") or []:
             st.info(note)
         if result["selected_rows"] == 0:
@@ -547,8 +694,9 @@ elif load_from_drive:
                 "「全件（再分析）」または期間指定を変更してください。"
             )
     except Exception as e:
-        st.error(f"最新CSVの取得エラー: {e}")
-        logger.exception("latest csv load failed")
+        st.session_state.force_csv_reload = False
+        st.error(f"CSVの取得エラー: {e}")
+        logger.exception("vr csv load failed")
 
 df = st.session_state.df
 
@@ -558,16 +706,18 @@ if df is not None:
     if meta or latest_info:
         name = latest_info.get("name") or meta.get("source_name") or "-"
         modified = latest_info.get("modified_time") or "(不明)"
+        mode_disp = "全員" if meta.get("analysis_mode") == "all" else "個人"
         st.caption(
-            f"使用中CSV: {name} / 更新日時: {modified} / 取り込みモード: {meta.get('mode')} / "
+            f"使用中CSV: {name} / modifiedTime: {modified} / 選択モード: {mode_disp}"
+            + (f"({meta.get('selected_device')})" if meta.get("selected_device") else "")
+            + f" / 取り込み: {meta.get('mode')} / "
             f"元データ {meta.get('total_rows')} 行 → 表示中 {len(df)} 行"
             + (f" / 日付カラム: {meta.get('date_column_used')}" if meta.get("date_column_used") else "")
         )
-        if meta.get("selection_log"):
-            with st.expander("最新CSV選定ログ（確認用）", expanded=False):
-                st.code(meta["selection_log"])
+        if meta.get("usage_log") or meta.get("selection_log"):
+            with st.expander("使用CSVログ（確認用）", expanded=False):
+                st.code(meta.get("usage_log") or meta.get("selection_log"))
 
-    # サイドバー：取り込み履歴
     with st.sidebar:
         st.markdown("### 🗂 取り込み履歴")
         try:
@@ -585,261 +735,41 @@ if df is not None:
         except Exception as e:
             st.caption(f"履歴表示エラー: {e}")
 
-    # サイドバーフィルター
-    with st.sidebar:
-        st.markdown("### 🔍 データフィルター")
+    from app.vr_dashboard_charts import render_vr_dashboard
 
-        # 保育者フィルター
-        if "player_id" in df.columns:
-            all_players = ["全員"] + sorted(df["player_id"].dropna().unique().tolist())
-            selected_player = st.selectbox("保育者（player_id）", all_players)
-        else:
-            selected_player = "全員"
-
-        # 事象フィルター
-        if "event_type" in df.columns:
-            all_events = ["全て"] + sorted(df["event_type"].dropna().unique().tolist())
-            selected_event = st.selectbox("事象タイプ", all_events)
-        else:
-            selected_event = "全て"
-
-        # 場所フィルター
-        if "location" in df.columns:
-            all_locations = ["全て"] + sorted(df["location"].dropna().unique().tolist())
-            selected_location = st.selectbox("場所", all_locations)
-        else:
-            selected_location = "全て"
-
-    # フィルター適用
-    filtered_df = df.copy()
-    if selected_player != "全員" and "player_id" in df.columns:
-        filtered_df = filtered_df[filtered_df["player_id"] == selected_player]
-    if selected_event != "全て" and "event_type" in df.columns:
-        filtered_df = filtered_df[filtered_df["event_type"] == selected_event]
-    if selected_location != "全て" and "location" in df.columns:
-        filtered_df = filtered_df[filtered_df["location"] == selected_location]
-
-    # ── データプレビュー ──
-    st.markdown('<div class="section-header">📋 データプレビュー</div>', unsafe_allow_html=True)
-    st.dataframe(filtered_df, use_container_width=True, height=250)
-
-    # ── KPIカード ──
-    st.markdown('<div class="section-header">📊 基本情報</div>', unsafe_allow_html=True)
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    total_rows = len(filtered_df)
-    event_rows = filtered_df[filtered_df["event_type"].notna() & (filtered_df["event_type"] != "None")] if "event_type" in filtered_df.columns else filtered_df
-
-    with col1:
-        st.metric("総レコード数", f"{total_rows} 件")
-    with col2:
-        st.metric("総イベント数", f"{len(event_rows)} 件")
-    with col3:
-        if "reaction_time" in filtered_df.columns:
-            avg_rt = filtered_df["reaction_time"].replace(0, pd.NA).dropna().mean()
-            st.metric("平均反応時間", f"{avg_rt:.2f} 秒" if pd.notna(avg_rt) else "N/A")
-        else:
-            st.metric("平均反応時間", "N/A")
-    with col4:
-        if "reaction_time" in filtered_df.columns:
-            max_rt = filtered_df["reaction_time"].replace(0, pd.NA).dropna().max()
-            st.metric("最長反応時間", f"{max_rt:.2f} 秒" if pd.notna(max_rt) else "N/A")
-        else:
-            st.metric("最長反応時間", "N/A")
-    with col5:
-        if "reaction_time" in filtered_df.columns:
-            min_rt = filtered_df["reaction_time"].replace(0, pd.NA).dropna().min()
-            st.metric("最短反応時間", f"{min_rt:.2f} 秒" if pd.notna(min_rt) else "N/A")
-        else:
-            st.metric("最短反応時間", "N/A")
-
-    # ── グラフ行1：反応時間推移 ＋ 事象別平均反応時間 ──
-    try:
-        st.markdown('<div class="section-header">📈 反応時間分析</div>', unsafe_allow_html=True)
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            if "reaction_time" in filtered_df.columns:
-                rt_df = filtered_df[filtered_df["reaction_time"] > 0].copy()
-                if "event_type" in rt_df.columns:
-                    rt_df["color"] = rt_df["event_type"].apply(get_event_color)
-                    fig_line = px.line(
-                        rt_df.reset_index(),
-                        x="index",
-                        y="reaction_time",
-                        color="event_type",
-                        color_discrete_map=EVENT_COLORS,
-                        title="反応時間の推移（事象別）",
-                        labels={"index": "レコード番号", "reaction_time": "反応時間（秒）", "event_type": "事象"}
-                    )
-                else:
-                    fig_line = px.line(rt_df.reset_index(), x="index", y="reaction_time", title="反応時間の推移")
-                fig_line.update_layout(height=350)
-                st.plotly_chart(fig_line, use_container_width=True)
-
-        with col_b:
-            if "event_type" in filtered_df.columns and "reaction_time" in filtered_df.columns:
-                event_avg = (
-                    filtered_df[filtered_df["reaction_time"] > 0]
-                    .groupby("event_type")["reaction_time"]
-                    .mean()
-                    .reset_index()
-                    .rename(columns={"reaction_time": "平均反応時間"})
-                )
-                event_avg = event_avg[event_avg["event_type"] != "None"]
-                event_avg["color"] = event_avg["event_type"].apply(get_event_color)
-                fig_bar = px.bar(
-                    event_avg,
-                    x="event_type",
-                    y="平均反応時間",
-                    color="event_type",
-                    color_discrete_map=EVENT_COLORS,
-                    title="事象別 平均反応時間",
-                    labels={"event_type": "事象", "平均反応時間": "平均反応時間（秒）"}
-                )
-                fig_bar.update_layout(height=350, showlegend=False)
-                st.plotly_chart(fig_bar, use_container_width=True)
-    except Exception as e:
-        st.warning(f"反応時間分析グラフの表示エラー: {e}")
-
-    # ── グラフ行2：保育者別比較 ＋ 場所別ヒートマップ ──
-    try:
-        col_c, col_d = st.columns(2)
-
-        with col_c:
-            st.markdown('<div class="section-header">👤 保育者別 反応時間比較</div>', unsafe_allow_html=True)
-            if "player_id" in filtered_df.columns and "reaction_time" in filtered_df.columns:
-                player_avg = (
-                    filtered_df[filtered_df["reaction_time"] > 0]
-                    .groupby("player_id")["reaction_time"]
-                    .mean()
-                    .reset_index()
-                    .rename(columns={"reaction_time": "平均反応時間"})
-                )
-                fig_player = px.bar(
-                    player_avg,
-                    x="player_id",
-                    y="平均反応時間",
-                    color="player_id",
-                    title="保育者別 平均反応時間",
-                    labels={"player_id": "保育者ID", "平均反応時間": "平均反応時間（秒）"}
-                )
-                fig_player.update_layout(height=350, showlegend=False)
-                st.plotly_chart(fig_player, use_container_width=True)
-
-        with col_d:
-            st.markdown('<div class="section-header">📍 場所別 危険イベント数</div>', unsafe_allow_html=True)
-            if "location" in filtered_df.columns and "event_type" in filtered_df.columns:
-                loc_df = filtered_df[
-                    filtered_df["event_type"].notna() & (filtered_df["event_type"] != "None")
-                ]
-                loc_count = loc_df.groupby(["location", "event_type"]).size().reset_index(name="件数")
-                fig_loc = px.bar(
-                    loc_count,
-                    x="location",
-                    y="件数",
-                    color="event_type",
-                    color_discrete_map=EVENT_COLORS,
-                    title="場所別 危険イベント発生数",
-                    labels={"location": "場所", "件数": "件数", "event_type": "事象"}
-                )
-                fig_loc.update_layout(height=350)
-                st.plotly_chart(fig_loc, use_container_width=True)
-    except Exception as e:
-        st.warning(f"保育者別・場所別グラフの表示エラー: {e}")
-
-    # ── グラフ行3：Event_Type / Target_Object 別件数 ＋ Data_Value推移 ──
-    try:
-        st.markdown('<div class="section-header">📊 イベント集計</div>', unsafe_allow_html=True)
-        col_e, col_f = st.columns(2)
-
-        with col_e:
-            if "event_type" in filtered_df.columns:
-                event_count = (
-                    filtered_df[filtered_df["event_type"].notna() & (filtered_df["event_type"].astype(str) != "None")]
-                    .groupby("event_type")
-                    .size()
-                    .reset_index(name="件数")
-                )
-                if not event_count.empty:
-                    fig_event_count = px.bar(
-                        event_count,
-                        x="event_type",
-                        y="件数",
-                        color="event_type",
-                        color_discrete_map=EVENT_COLORS,
-                        title="Event_Type別 件数",
-                        labels={"event_type": "事象", "件数": "件数"},
-                    )
-                    fig_event_count.update_layout(height=350, showlegend=False)
-                    st.plotly_chart(fig_event_count, use_container_width=True)
-
-        with col_f:
-            target_col = "target_object" if "target_object" in filtered_df.columns else "location"
-            if target_col in filtered_df.columns:
-                target_count = (
-                    filtered_df[filtered_df[target_col].notna() & (filtered_df[target_col].astype(str) != "None")]
-                    .groupby(target_col)
-                    .size()
-                    .reset_index(name="件数")
-                )
-                if not target_count.empty:
-                    fig_target_count = px.bar(
-                        target_count,
-                        x=target_col,
-                        y="件数",
-                        color=target_col,
-                        title="Target_Object別 件数",
-                        labels={target_col: "対象オブジェクト", "件数": "件数"},
-                    )
-                    fig_target_count.update_layout(height=350, showlegend=False)
-                    st.plotly_chart(fig_target_count, use_container_width=True)
-
-        value_col = "data_value" if "data_value" in filtered_df.columns else "reaction_time"
-        if value_col in filtered_df.columns:
-            dv_df = filtered_df.copy()
-            dv_df[value_col] = pd.to_numeric(dv_df[value_col], errors="coerce")
-            dv_df = dv_df[dv_df[value_col].notna()]
-            if not dv_df.empty:
-                if "timestamp" in dv_df.columns:
-                    x_col = "timestamp"
-                    x_label = "経過時間"
-                else:
-                    dv_df = dv_df.reset_index()
-                    x_col = "index"
-                    x_label = "レコード番号"
-                fig_data_value = px.line(
-                    dv_df,
-                    x=x_col,
-                    y=value_col,
-                    color="event_type" if "event_type" in dv_df.columns else None,
-                    color_discrete_map=EVENT_COLORS,
-                    title="Data_Valueの推移",
-                    labels={x_col: x_label, value_col: "Data_Value", "event_type": "事象"},
-                )
-                fig_data_value.update_layout(height=350)
-                st.plotly_chart(fig_data_value, use_container_width=True)
-    except Exception as e:
-        st.warning(f"イベント集計グラフの表示エラー: {e}")
+    filtered_df = render_vr_dashboard(df)
+    logger.info(
+        "[グラフ再描画] analysis_mode=%s selected_device=%s chart_records=%s columns=%s",
+        meta.get("analysis_mode"),
+        meta.get("selected_device"),
+        len(filtered_df),
+        list(filtered_df.columns),
+    )
+    if meta.get("files"):
+        for fmeta in meta["files"]:
+            logger.info(
+                "[グラフ使用CSV] device=%s name=%s fileId=%s modifiedTime=%s",
+                fmeta.get("device"),
+                fmeta.get("name"),
+                fmeta.get("file_id"),
+                fmeta.get("modified_time"),
+            )
 
     render_pdf_section(filtered_df)
 
 else:
-    st.info("👆 「最新CSVを取り込む」ボタンで、毎回最新のCSVだけを取得します。")
+    st.info(
+        "👆 「最新CSVを取り込む」で、毎回 Drive 一覧を再取得し、"
+        "端末ごとの最新CSV（modifiedTime）から分析します。"
+        "全員／個人を切り替えると、古いデータは破棄して再取得します。"
+    )
     st.markdown("""
     **取り込みルール：**
-    - Google Drive **フォルダURL** → 中のCSVを更新日時で並べ、最新1件のみ
-    - Google Drive **ファイルURL** → そのファイルを毎回新規ダウンロード
-    - ローカル `data/input` → 更新日時が最新のCSV
-    - ブラウザアップロード（複数） → ファイル名の日付が新しいもの優先
-
-    **対応カラム例：**
-    | 標準カラム名 | VR CSVカラム名 | 内容 |
-    |---|---|---|
-    | `timestamp` | `Elapsed_Time` | 記録時刻 / 経過時間 |
-    | `player_id` | `Player_ID` | 保育者ID |
-    | `event_type` | `Event_Type` | 事象タイプ |
-    | `reaction_time` | `Data_Value` | 反応時間 / データ値 |
-    | `location` | `Target_Object` | 対象オブジェクト |
-    | `gaze_x`, `gaze_y` | `WorldX`, `WorldY` | 視線・位置座標 |
+    - **全員** → VR各端末の最新CSVを1つずつ取得して統合（全体で1ファイルではない）
+    - **個人** → 選択した個人 / VR端末の最新CSVのみ
+    - 最新判定はファイル名ではなく Google Drive の **modifiedTime**
+    - 可視化・表・集計の項目名は CSV ヘッダー行どおり
+      （`Elapsed_Time`, `Event_Type`, `Player_ID`, `Target_Object`, `Data_Value`,
+      `WorldX`, `WorldY`, `WorldZ`, `LocalX`, `LocalY`, `LocalZ`）
+    - フォルダURL推奨（4台分のCSV一覧取得）。ファイルURLは単一CSVとして扱う
     """)

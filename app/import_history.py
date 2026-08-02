@@ -21,15 +21,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "import_history.db"
 
 ROW_HASH_COLUMNS = [
-    "timestamp",
-    "player_id",
-    "event_type",
-    "location",
-    "target_object",
-    "reaction_time",
-    "data_value",
-    "gaze_x",
-    "gaze_y",
+    "Elapsed_Time",
+    "Event_Type",
+    "Player_ID",
+    "Target_Object",
+    "Data_Value",
+    "WorldX",
+    "WorldY",
+    "WorldZ",
+    "LocalX",
+    "LocalY",
+    "LocalZ",
 ]
 
 

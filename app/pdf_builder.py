@@ -15,17 +15,23 @@ FONT = "HeiseiKakuGo-W5"
 
 
 def _value_series(df: pd.DataFrame) -> pd.Series:
-    col = "data_value" if "data_value" in df.columns else "reaction_time"
-    if col not in df.columns:
-        return pd.Series(dtype=float)
-    return pd.to_numeric(df[col], errors="coerce").dropna()
+    for col in ("Data_Value", "data_value", "reaction_time"):
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").dropna()
+    return pd.Series(dtype=float)
+
+
+def _event_column(df: pd.DataFrame) -> str | None:
+    for col in ("Event_Type", "event_type"):
+        if col in df.columns:
+            return col
+    return None
 
 
 def _target_column(df: pd.DataFrame) -> str | None:
-    if "target_object" in df.columns:
-        return "target_object"
-    if "location" in df.columns:
-        return "location"
+    for col in ("Target_Object", "target_object", "location"):
+        if col in df.columns:
+            return col
     return None
 
 
@@ -33,9 +39,10 @@ def build_analysis_comment(df: pd.DataFrame) -> str:
     total = len(df)
     parts = [f"総レコード数は {total} 件です。"]
 
-    if "event_type" in df.columns:
+    event_col = _event_column(df)
+    if event_col:
         event_counts = (
-            df[df["event_type"].notna() & (df["event_type"].astype(str) != "None")]["event_type"]
+            df[df[event_col].notna() & (df[event_col].astype(str) != "None")][event_col]
             .value_counts()
         )
         if not event_counts.empty:
@@ -96,23 +103,24 @@ def build_pdf_bytes(df: pd.DataFrame) -> bytes:
 
     elements.append(Paragraph("基本情報", heading_style))
     summary_data = [["項目", "値"], ["総レコード数", str(len(df))]]
-    if "event_type" in df.columns:
-        event_rows = df[df["event_type"].notna() & (df["event_type"].astype(str) != "None")]
+    event_col = _event_column(df)
+    if event_col:
+        event_rows = df[df[event_col].notna() & (df[event_col].astype(str) != "None")]
         summary_data.append(["イベント件数", str(len(event_rows))])
     elements.append(_make_table(summary_data, [120, 280]))
     elements.append(Spacer(1, 12))
 
-    if "event_type" in df.columns:
+    if event_col:
         elements.append(Paragraph("Event_Type 別件数", heading_style))
         event_count = (
-            df[df["event_type"].notna() & (df["event_type"].astype(str) != "None")]
-            .groupby("event_type")
+            df[df[event_col].notna() & (df[event_col].astype(str) != "None")]
+            .groupby(event_col)
             .size()
             .reset_index(name="件数")
         )
         event_table = [["Event_Type", "件数"]]
         for _, row in event_count.iterrows():
-            event_table.append([str(row["event_type"]), str(row["件数"])])
+            event_table.append([str(row[event_col]), str(row["件数"])])
         if len(event_table) == 1:
             event_table.append(["（データなし）", "0"])
         elements.append(_make_table(event_table, [200, 200]))
