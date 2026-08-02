@@ -541,18 +541,20 @@ drive_url = st.text_input(
     ),
 )
 st.caption(
-    "固定参照フォルダ: `1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9` ／ "
-    "単体 fileId の固定読み込みはしません"
+    "固定フォルダ: [csv - Google Drive](https://drive.google.com/drive/folders/1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9)"
 )
 st.caption(
-    "推奨: Streamlit Cloud の Secrets に `GOOGLE_API_KEY` を設定すると、"
-    "Drive の modifiedTime で正確に最新CSVを判定できます。"
+    "一覧取得に失敗する場合は、下の Google API Key を入力するか、"
+    "Streamlit Cloud の Secrets に `GOOGLE_API_KEY` を設定してください。"
 )
 api_key_input = st.text_input(
-    "Google API Key（任意・フォルダ一覧用）",
+    "Google API Key（推奨・フォルダ一覧用）",
     value="",
     type="password",
-    help="フォルダ内のCSV一覧取得に使います。未設定でも公開フォルダの取得を試みます。",
+    help=(
+        "Google Cloud Console で Drive API を有効化した API キー。"
+        "未設定でも公開フォルダの取得を試みますが、Cloud 環境では API キーが確実です。"
+    ),
 )
 prefer_local = False  # sample / ローカル仮データは使わず、常に Google Drive から取得
 st.caption("データソース: Google Drive 実CSVのみ（sample_session.csv / 仮データは使用しません）")

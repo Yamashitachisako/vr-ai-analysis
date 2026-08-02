@@ -8,6 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -225,124 +226,187 @@ def _modified_time_from_filename(name: str) -> str | None:
     )
 
 
+def _browser_headers() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+def _http_get_text(url: str, *, timeout: int = 60, retries: int = 3) -> str:
+    """公開ページ取得（簡易リトライ付き）。"""
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            request = Request(url, headers=_browser_headers())
+            with urlopen(request, timeout=timeout) as resp:
+                raw = resp.read()
+            return raw.decode("utf-8", errors="ignore")
+        except Exception as e:
+            last_error = e
+            logger.warning("http get failed attempt=%s url=%s err=%s", attempt, url, e)
+    raise RuntimeError(f"URL取得に失敗しました: {url} ({last_error})")
+
+
+def _parse_embedded_folder_html(html: str) -> list[CsvFileInfo]:
+    """embeddedfolderview HTML から CSV 一覧を抽出。"""
+    by_id: dict[str, CsvFileInfo] = {}
+
+    patterns = [
+        # 典型: id="entry-xxx" ... flip-entry-title>name.csv
+        r'id="entry-([a-zA-Z0-9_-]+)"[\s\S]{0,2000}?flip-entry-title[^>]*>([^<]+\.csv)',
+        # href 経由
+        r'href="https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)/[^"]*"[\s\S]{0,800}?'
+        r'flip-entry-title[^>]*>([^<]+\.csv)',
+        r'href="https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)/[^"]*"[\s\S]{0,500}?>'
+        r"([^<]+\.csv)<",
+    ]
+    for pat in patterns:
+        for file_id, name in re.findall(pat, html, flags=re.IGNORECASE):
+            name = html_unescape(name).strip()
+            if not name.lower().endswith(".csv"):
+                continue
+            by_id[file_id] = CsvFileInfo(
+                file_id=file_id,
+                name=name,
+                modified_time=_modified_time_from_filename(name),
+                source="drive",
+            )
+
+    # id と title を順番に対応付けるフォールバック
+    if not by_id:
+        ids = re.findall(r'id="entry-([a-zA-Z0-9_-]+)"', html)
+        titles = [
+            html_unescape(t).strip()
+            for t in re.findall(r"flip-entry-title[^>]*>([^<]+\.csv)", html, flags=re.I)
+        ]
+        for file_id, name in zip(ids, titles):
+            by_id[file_id] = CsvFileInfo(
+                file_id=file_id,
+                name=name,
+                modified_time=_modified_time_from_filename(name),
+                source="drive",
+            )
+
+    return list(by_id.values())
+
+
 def list_drive_csvs_embedded(folder_id: str) -> list[CsvFileInfo]:
     """公開フォルダの embeddedfolderview から CSV の id/name を取得。"""
-    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ja,en;q=0.9",
-        },
-    )
-    with urlopen(request, timeout=60) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
+    urls = [
+        f"https://drive.google.com/embeddedfolderview?id={folder_id}#list",
+        f"https://drive.google.com/embeddedfolderview?id={folder_id}&usp=sharing",
+        f"https://drive.google.com/embeddedfolderview?id={folder_id}",
+    ]
+    last_html = ""
+    for url in urls:
+        try:
+            html = _http_get_text(url, timeout=75, retries=2)
+            last_html = html
+            files = _parse_embedded_folder_html(html)
+            logger.info(
+                "drive embedded listed %s csv files from %s (html_len=%s)",
+                len(files),
+                url,
+                len(html),
+            )
+            if files:
+                return files
+        except Exception as e:
+            logger.warning("embedded fetch failed url=%s err=%s", url, e)
 
-    pairs = re.findall(
-        r'id="entry-([a-zA-Z0-9_-]+)"[\s\S]{0,1200}?flip-entry-title[^>]*>([^<]+\.csv)',
-        html,
-        flags=re.IGNORECASE,
-    )
-    if not pairs:
-        pairs = re.findall(
-            r'href="https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)/[^"]*"[\s\S]{0,500}?>'
-            r"([^<]+\.csv)<",
-            html,
-            flags=re.IGNORECASE,
-        )
-
-    by_id: dict[str, CsvFileInfo] = {}
-    for file_id, name in pairs:
-        name = name.strip()
-        if not name.lower().endswith(".csv"):
-            continue
-        by_id[file_id] = CsvFileInfo(
-            file_id=file_id,
-            name=name,
-            modified_time=_modified_time_from_filename(name),
-            source="drive",
-        )
-
-    files = list(by_id.values())
-    logger.info(
-        "drive embedded listed %s csv files in folder %s",
-        len(files),
-        folder_id,
-    )
-    return files
+    # 診断用
+    lower = last_html.lower()
+    if last_html and ("sign in" in lower or "accounts.google" in lower):
+        logger.warning("embedded HTML looks like a sign-in wall (len=%s)", len(last_html))
+    return []
 
 
 def list_drive_csvs_public_html(folder_id: str) -> list[CsvFileInfo]:
     """公開フォルダのHTMLからファイルIDを抽出（日時は取得できない場合あり）。"""
-    url = f"https://drive.google.com/drive/folders/{folder_id}"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-        },
-    )
-    with urlopen(request, timeout=60) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
-
-    # /file/d/{id}/ と近くのファイル名を拾う
-    file_ids = re.findall(r"/file/d/([a-zA-Z0-9_-]{10,})", html)
-    # "name":"something.csv" patterns in embedded JSON
-    named = re.findall(r'"([^\"]+\.csv)"\s*,\s*"([a-zA-Z0-9_-]{20,})"', html)
-    named2 = re.findall(r'"id"\s*:\s*"([a-zA-Z0-9_-]{20,})"[^}]*?"name"\s*:\s*"([^\"]+\.csv)"', html)
-    named3 = re.findall(r'"name"\s*:\s*"([^\"]+\.csv)"[^}]*?"id"\s*:\s*"([a-zA-Z0-9_-]{20,})"', html)
-
+    urls = [
+        f"https://drive.google.com/drive/folders/{folder_id}?usp=sharing",
+        f"https://drive.google.com/drive/folders/{folder_id}",
+    ]
     by_id: dict[str, CsvFileInfo] = {}
-    for fid in file_ids:
-        by_id.setdefault(
-            fid,
-            CsvFileInfo(
-                file_id=fid,
-                name=f"{fid}.csv",
-                modified_time=_modified_time_from_filename(f"{fid}.csv"),
-                source="drive",
-            ),
-        )
-    for name, fid in named + [(n, i) for i, n in named2] + named3:
-        if not str(name).lower().endswith(".csv"):
+    for url in urls:
+        try:
+            html = _http_get_text(url, timeout=75, retries=2)
+        except Exception as e:
+            logger.warning("public html fetch failed url=%s err=%s", url, e)
             continue
-        by_id[fid] = CsvFileInfo(
-            file_id=fid,
-            name=name,
-            modified_time=_modified_time_from_filename(name),
-            source="drive",
+
+        # まず embedded と同じパーサも試す
+        for info in _parse_embedded_folder_html(html):
+            by_id[info.file_id] = info
+
+        file_ids = re.findall(r"/file/d/([a-zA-Z0-9_-]{10,})", html)
+        named = re.findall(r'"([^\"]+\.csv)"\s*,\s*"([a-zA-Z0-9_-]{20,})"', html)
+        named2 = re.findall(
+            r'"id"\s*:\s*"([a-zA-Z0-9_-]{20,})"[^}]*?"name"\s*:\s*"([^\"]+\.csv)"',
+            html,
+        )
+        named3 = re.findall(
+            r'"name"\s*:\s*"([^\"]+\.csv)"[^}]*?"id"\s*:\s*"([a-zA-Z0-9_-]{20,})"',
+            html,
+        )
+        # Drive の配列データ: ["Log_....csv", ...., "fileId"]
+        named4 = re.findall(
+            r'\["([^"]+\.csv)"\s*,[^\[\]]{0,200}?"([a-zA-Z0-9_-]{20,})"',
+            html,
         )
 
-    # modifiedTime in page JSON
-    for fid, info in list(by_id.items()):
-        m = re.search(
-            rf'{re.escape(fid)}[^\\{{}}]{{0,400}}?"modifiedTime"\s*:\s*"([^"]+)"',
-            html,
-        )
-        if not m:
-            m = re.search(
-                rf'"modifiedTime"\s*:\s*"([^"]+)"[^\\{{}}]{{0,400}}?{re.escape(fid)}',
-                html,
+        for fid in file_ids:
+            by_id.setdefault(
+                fid,
+                CsvFileInfo(
+                    file_id=fid,
+                    name=f"{fid}.csv",
+                    modified_time=_modified_time_from_filename(f"{fid}.csv"),
+                    source="drive",
+                ),
             )
-        if m:
-            info.modified_time = m.group(1)
-        c = re.search(
-            rf'{re.escape(fid)}[^\\{{}}]{{0,400}}?"createdTime"\s*:\s*"([^"]+)"',
-            html,
-        )
-        if c:
-            info.created_time = c.group(1)
-        if not info.modified_time:
-            info.modified_time = _modified_time_from_filename(info.name)
+        for name, fid in named + named3 + named4 + [(n, i) for i, n in named2]:
+            if not str(name).lower().endswith(".csv"):
+                continue
+            name = html_unescape(str(name)).strip()
+            by_id[fid] = CsvFileInfo(
+                file_id=fid,
+                name=name,
+                modified_time=_modified_time_from_filename(name),
+                source="drive",
+            )
+
+        for fid, info in list(by_id.items()):
+            if info.modified_time and not info.modified_time.endswith(".csv"):
+                continue
+            m = re.search(
+                rf'{re.escape(fid)}.{{0,400}}?"modifiedTime"\s*:\s*"([^"]+)"',
+                html,
+                flags=re.S,
+            )
+            if m:
+                info.modified_time = m.group(1)
+            if not info.modified_time:
+                info.modified_time = _modified_time_from_filename(info.name)
+
+        if by_id:
+            break
 
     files = list(by_id.values())
-    logger.info("drive html listed %s csv-like files in folder %s", len(files), folder_id)
-    return files
+    real_named = [
+        f for f in files if f.name.lower().endswith(".csv") and f.name != f"{f.file_id}.csv"
+    ]
+    result = real_named or files
+    logger.info("drive html listed %s csv-like files in folder %s", len(result), folder_id)
+    return result
 
 
 def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[CsvFileInfo]:
@@ -358,7 +422,7 @@ def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[C
             logger.warning("drive api list failed: %s", e)
             errors.append(f"Drive API: {e}")
     else:
-        errors.append("GOOGLE_API_KEY 未設定（Drive APIの modifiedTime は使えません）")
+        errors.append("GOOGLE_API_KEY 未設定")
 
     # 公開フォルダ向け: embeddedfolderview が最も安定
     try:
@@ -389,9 +453,10 @@ def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[C
     raise FileNotFoundError(
         "フォルダ内のCSV一覧を取得できませんでした。"
         f"（{detail}） "
+        f"対象フォルダ: https://drive.google.com/drive/folders/{folder_id} 。"
         "共有を「リンクを知っている全員が閲覧可」にし、"
-        "Streamlit Cloud の Secrets に GOOGLE_API_KEY を設定すると "
-        "Drive の modifiedTime で正確に最新判定できます。"
+        "画面の Google API Key 欄、または Streamlit Cloud Secrets の "
+        "GOOGLE_API_KEY を設定してください。"
     )
 
 
