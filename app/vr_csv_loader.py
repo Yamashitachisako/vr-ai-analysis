@@ -111,12 +111,18 @@ def prepare_vr_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     lower_map = {c.lower(): c for c in out.columns}
     sample_hits = [name for name in FORBIDDEN_SAMPLE_COLUMNS if name in lower_map]
-    # サンプル形式（timestamp 等）だけで構成されている場合は拒否
-    if len(sample_hits) >= 4 and "Elapsed_Time" not in out.columns and "Player_ID" not in out.columns:
+    has_real = "Elapsed_Time" in out.columns or "Player_ID" in out.columns or "Event_Type" in out.columns
+    # サンプル形式（timestamp / player_id 等）は拒否。実ヘッダーが無い場合も拒否。
+    if sample_hits and not has_real:
         raise ValueError(
             "サンプルCSV形式（timestamp / player_id 等）を検出しました。"
-            "sample_session.csv や仮データは使えません。"
-            "Google Drive フォルダ内の実CSVを読み込んでください。"
+            "仮データは使えません。Google Drive フォルダ内の実CSV"
+            "（Elapsed_Time / Event_Type / Player_ID 等）を読み込んでください。"
+        )
+    if not has_real:
+        raise ValueError(
+            "実CSVヘッダー（Elapsed_Time / Event_Type / Player_ID）が見つかりません。"
+            "Google Drive 上の VR ログ CSV を使用してください。"
         )
 
     for col in NUMERIC_COLUMNS:

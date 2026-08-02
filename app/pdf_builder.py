@@ -15,24 +15,18 @@ FONT = "HeiseiKakuGo-W5"
 
 
 def _value_series(df: pd.DataFrame) -> pd.Series:
-    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value", "data_value"):
+    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value"):
         if col in df.columns:
             return pd.to_numeric(df[col], errors="coerce").dropna()
     return pd.Series(dtype=float)
 
 
 def _event_column(df: pd.DataFrame) -> str | None:
-    for col in ("Event_Type", "event_type"):
-        if col in df.columns:
-            return col
-    return None
+    return "Event_Type" if "Event_Type" in df.columns else None
 
 
 def _target_column(df: pd.DataFrame) -> str | None:
-    for col in ("Target_Object", "target_object", "location"):
-        if col in df.columns:
-            return col
-    return None
+    return "Target_Object" if "Target_Object" in df.columns else None
 
 
 def build_analysis_comment(df: pd.DataFrame) -> str:

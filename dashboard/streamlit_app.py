@@ -499,7 +499,7 @@ st.markdown('<div class="section-header">📂 データ読み込み</div>', unsa
 st.caption(
     "ボタン押下のたびに Google Drive の CSV 一覧を再取得します。"
     "最新判定はファイル名ではなく **modifiedTime** です。"
-    "「全員」= 各VR端末の最新CSVを統合 / 「個人」= 選択端末の最新CSVのみ。"
+    "列名は実CSVヘッダー（Elapsed_Time / Event_Type / Player_ID 等）をそのまま使います。"
 )
 
 uploaded_files = st.file_uploader(
@@ -538,7 +538,7 @@ api_key_input = st.text_input(
     help="フォルダ内のCSV一覧取得に使います。未設定でも公開フォルダの取得を試みます。",
 )
 prefer_local = st.checkbox(
-    "ローカル data/input のCSVを優先する（非推奨・sample_session.csvは除外）",
+    "ローカル data/input の実CSVを優先する（通常は Drive を使用）",
     value=False,
 )
 load_from_drive = st.button(
@@ -808,17 +808,16 @@ if df is not None:
 else:
     st.info(
         "👆 「最新CSVを取り込む」で、毎回 Drive 一覧を再取得し、"
-        "端末ごとの最新CSV（modifiedTime）から分析します。"
+        "modifiedTime が最新の実CSVから分析します。"
         "全員／個人を切り替えると、古いデータは破棄して再取得します。"
     )
     st.markdown("""
     **取り込みルール：**
     - **全員** → Driveフォルダ内の modifiedTime 最新CSVを1件読み込み（全行）
-    - **個人** → 同じ最新CSVのうち、選択した Player_ID（ota / Player 等）の行のみ
-    - sample_session.csv や timestamp/player_id などの仮項目は使わない
-    - 列名は実CSVヘッダーどおり
+    - **個人** → 同じ最新CSVのうち、選択した `Player_ID`（ota / Player 等）の行のみ
+    - 仮データ・サンプルCSVは使わない
+    - 列名はリネームせず、実CSVヘッダーどおり
       （`Elapsed_Time`, `Event_Type`, `Player_ID`, `Player_X`, `Player_Y`, `Player_Z`,
       `Target_Object`, `Reaction_Time_Micro`, `World_X`, `World_Y`, `World_Z`,
       `Local_X`, `Local_Y`, `Local_Z`）
     """)
-sample_session.csv や仮データを完全にやめて、Google Drive上の実CSVヘッダー Elapsed_Time / Event_Type / Player_ID などをそのまま使ってください。

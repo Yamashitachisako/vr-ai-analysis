@@ -22,32 +22,28 @@ from app.import_history import (
 
 logger = logging.getLogger(__name__)
 
+# カレンダー日付候補のみ。Elapsed_Time（経過時間）は含めない。
 DATE_COLUMN_CANDIDATES = [
-    "session_date",
     "Session_Date",
-    "record_date",
     "Record_Date",
-    "date",
     "Date",
-    "datetime",
     "DateTime",
-    "created_at",
     "Created_At",
-    "timestamp",
-    "Timestamp",
-    "Elapsed_Time",
 ]
 
 
 def detect_date_columns(df: pd.DataFrame) -> list[str]:
-    """カレンダー日付として使えそうなカラム候補を返す。"""
+    """カレンダー日付として使えそうなカラム候補を返す。Elapsed_Time は除外。"""
+    skip = {"elapsed_time", "reaction_time_micro", "reaction_time_mic"}
     found: list[str] = []
     for col in df.columns:
         name = str(col)
+        if name.lower() in skip:
+            continue
         if name in DATE_COLUMN_CANDIDATES or name.lower() in {c.lower() for c in DATE_COLUMN_CANDIDATES}:
             found.append(name)
             continue
-        if re.search(r"date|time|日時|日付", name, re.IGNORECASE):
+        if re.search(r"date|日時|日付", name, re.IGNORECASE):
             found.append(name)
     # 重複除去（順序保持）
     seen = set()

@@ -1,4 +1,4 @@
-"""取り込み履歴・新規抽出・日付フィルタの簡易テスト。"""
+"""取り込み履歴・新規抽出・日付フィルタの簡易テスト（実CSVヘッダー）。"""
 
 from __future__ import annotations
 
@@ -16,31 +16,75 @@ from app.import_history import clear_history, get_connection
 from app.incremental_loader import detect_date_columns, filter_by_date_range, prepare_analysis_dataframe
 
 
+def _row(
+    *,
+    elapsed: str,
+    player: str,
+    event: str,
+    reaction: float,
+    session_date: str,
+) -> dict:
+    return {
+        "Elapsed_Time": elapsed,
+        "Event_Type": event,
+        "Player_ID": player,
+        "Player_X": 0.1,
+        "Player_Y": 0.9,
+        "Player_Z": -10.0,
+        "Target_Object": "Toy",
+        "Reaction_Time_Micro": reaction,
+        "World_X": 1.0,
+        "World_Y": 2.0,
+        "World_Z": 3.0,
+        "Local_X": 0.0,
+        "Local_Y": 0.0,
+        "Local_Z": 0.0,
+        "Session_Date": session_date,
+    }
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = Path(tmp) / "test_history.db"
         conn = get_connection(db)
 
         df1 = pd.DataFrame(
-            {
-                "timestamp": [1.0, 2.0, 3.0],
-                "player_id": ["A", "A", "B"],
-                "event_type": ["誤嚥", "転倒", "誤嚥"],
-                "location": ["リビング", "廊下", "キッチン"],
-                "reaction_time": [1.1, 2.2, 3.3],
-                "Session_Date": ["2026-07-01", "2026-07-02", "2026-07-10"],
-            }
+            [
+                _row(
+                    elapsed="00:00.01",
+                    player="ota",
+                    event="PlayerPosition",
+                    reaction=1.1,
+                    session_date="2026-07-01",
+                ),
+                _row(
+                    elapsed="00:00.02",
+                    player="ota",
+                    event="Gaze",
+                    reaction=2.2,
+                    session_date="2026-07-02",
+                ),
+                _row(
+                    elapsed="00:00.03",
+                    player="Player",
+                    event="PlayerPosition",
+                    reaction=3.3,
+                    session_date="2026-07-10",
+                ),
+            ]
         )
 
         r1 = prepare_analysis_dataframe(
             df1,
             file_id="file-test",
-            file_name="test.csv",
+            file_name="Log_Quest.csv",
             content=b"abc",
             mode="new_only",
             db_path=db,
         )
         assert r1["selected_rows"] == 3, r1
+        assert "Player_ID" in r1["df"].columns
+        assert "player_id" not in r1["df"].columns
         print("OK new_only first import:", r1["selected_rows"])
 
         r2 = prepare_analysis_dataframe(
@@ -57,14 +101,15 @@ def main() -> None:
             [
                 df1,
                 pd.DataFrame(
-                    {
-                        "timestamp": [4.0],
-                        "player_id": ["C"],
-                        "event_type": ["転倒"],
-                        "location": ["廊下"],
-                        "reaction_time": [4.4],
-                        "Session_Date": ["2026-07-15"],
-                    }
+                    [
+                        _row(
+                            elapsed="00:00.04",
+                            player="player",
+                            event="Gaze",
+                            reaction=4.4,
+                            session_date="2026-07-15",
+                        )
+                    ]
                 ),
             ],
             ignore_index=True,
@@ -81,6 +126,7 @@ def main() -> None:
 
         cols = detect_date_columns(df1)
         assert "Session_Date" in cols, cols
+        assert "Elapsed_Time" not in cols, cols
         filtered, used = filter_by_date_range(
             df1,
             start_date=date(2026, 7, 1),

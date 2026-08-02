@@ -18,7 +18,6 @@ from app.vr_csv_loader import (
     unique_player_ids,
     infer_device_id,
     load_vr_csvs_for_mode,
-    FORBIDDEN_SAMPLE_COLUMNS,
 )
 
 REAL_HEADERS = [
@@ -88,10 +87,10 @@ def test_reject_sample_schema():
         prepare_vr_dataframe(sample)
         raise AssertionError("sample should be rejected")
     except ValueError as e:
-        assert "サンプル" in str(e)
+        assert "サンプル" in str(e) or "実CSV" in str(e)
 
 
-def test_player_id_not_replaced():
+def test_player_id_column_required_for_individual_filter():
     info = CsvFileInfo(file_id="1", name="Log_Quest.csv", modified_time="2026-08-01T00:00:00Z")
     df = pd.DataFrame({"Player_ID": ["ota", "ota"]})
     assert infer_device_id(info, df) == "ota"
@@ -144,6 +143,6 @@ def test_load_latest_local_preserves_headers_and_player():
 if __name__ == "__main__":
     test_prepare_keeps_real_headers()
     test_reject_sample_schema()
-    test_player_id_not_replaced()
+    test_player_id_column_required_for_individual_filter()
     test_load_latest_local_preserves_headers_and_player()
     print("OK: all vr_csv_loader tests passed")
