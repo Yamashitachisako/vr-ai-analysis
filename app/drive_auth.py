@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
+# Cloud / 運用で共有済みのサービスアカウント
+EXPECTED_SERVICE_ACCOUNT_EMAIL = (
+    "vr-ai-analysis-drive-reader@routinesupport.iam.gserviceaccount.com"
+)
+
 _token_holder: dict[str, Any] = {"creds": None, "fp": ""}
 
 
@@ -146,6 +151,11 @@ def auth_status() -> dict[str, Any]:
     return {
         "configured": bool(email),
         "client_email": email,
+        "expected_email": EXPECTED_SERVICE_ACCOUNT_EMAIL,
+        "email_matches_expected": (
+            email == EXPECTED_SERVICE_ACCOUNT_EMAIL if email else False
+        ),
         "token_ok": token_ok,
         "error": error,
+        "folder_id": "1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9",
     }

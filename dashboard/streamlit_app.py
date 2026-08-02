@@ -152,15 +152,21 @@ def get_google_api_key() -> str | None:
     return key or None
 
 
-def get_drive_auth_caption() -> tuple[str | None, bool]:
-    """(client_email, token_ok)"""
+def get_drive_auth_caption() -> tuple[str | None, bool, str]:
+    """(client_email, token_ok, expected_email)"""
     try:
-        from app.drive_auth import auth_status
+        from app.drive_auth import EXPECTED_SERVICE_ACCOUNT_EMAIL, auth_status
 
         status = auth_status()
-        return status.get("client_email"), bool(status.get("token_ok"))
+        return (
+            status.get("client_email"),
+            bool(status.get("token_ok")),
+            status.get("expected_email") or EXPECTED_SERVICE_ACCOUNT_EMAIL,
+        )
     except Exception:
-        return None, False
+        from app.drive_auth import EXPECTED_SERVICE_ACCOUNT_EMAIL
+
+        return None, False, EXPECTED_SERVICE_ACCOUNT_EMAIL
 
 
 def extract_google_drive_file_id(url: str) -> str:
@@ -551,7 +557,7 @@ st.info(
 )
 drive_url = DEFAULT_DRIVE_CSV_URL  # 固定。ユーザー入力の単体 fileId は使わない。
 
-sa_email, sa_ok = get_drive_auth_caption()
+sa_email, sa_ok, expected_sa = get_drive_auth_caption()
 if sa_email:
     if sa_ok:
         st.success(f"サービスアカウント認証OK: `{sa_email}`")
@@ -559,14 +565,18 @@ if sa_email:
         st.warning(
             f"サービスアカウントは設定済みですがトークン取得に失敗しています: `{sa_email}`"
         )
+    if sa_email != expected_sa:
+        st.warning(
+            f"想定メールは `{expected_sa}` です。Secrets の client_email を確認してください。"
+        )
     st.caption(
         "このメールアドレスに Google Drive フォルダを「閲覧者」で共有してください。"
     )
 else:
     st.warning(
         "Cloud ではサービスアカウント認証が必要です。"
-        "Streamlit Secrets に `[gcp_service_account]` を設定し、"
-        "表示される client_email へフォルダを共有してください。"
+        f"Streamlit Secrets に `[gcp_service_account]` を設定し、"
+        f"`{expected_sa}` へフォルダを共有してください。"
         "（例: `.streamlit/secrets.toml.example` を参照）"
     )
 
