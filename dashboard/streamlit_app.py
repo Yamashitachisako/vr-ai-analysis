@@ -152,8 +152,8 @@ def get_google_api_key() -> str | None:
     return key or None
 
 
-def get_drive_auth_caption() -> tuple[str | None, bool, str]:
-    """(client_email, token_ok, expected_email)"""
+def get_drive_auth_caption() -> tuple[str | None, bool, str, str | None]:
+    """(client_email, token_ok, expected_email, error)"""
     try:
         from app.drive_auth import EXPECTED_SERVICE_ACCOUNT_EMAIL, auth_status
 
@@ -162,11 +162,12 @@ def get_drive_auth_caption() -> tuple[str | None, bool, str]:
             status.get("client_email"),
             bool(status.get("token_ok")),
             status.get("expected_email") or EXPECTED_SERVICE_ACCOUNT_EMAIL,
+            status.get("error"),
         )
-    except Exception:
+    except Exception as e:
         from app.drive_auth import EXPECTED_SERVICE_ACCOUNT_EMAIL
 
-        return None, False, EXPECTED_SERVICE_ACCOUNT_EMAIL
+        return None, False, EXPECTED_SERVICE_ACCOUNT_EMAIL, str(e)
 
 
 def extract_google_drive_file_id(url: str) -> str:
@@ -223,11 +224,11 @@ def format_vr_usage_log(
     headers: list | None = None,
     player_ids: list | None = None,
 ) -> str:
-    mode_label = "全員（最大4台統合）" if mode == "all" else "個人（1台）"
+    mode_label = "全員（端末ごと最新）" if mode == "all" else "個人（1台）"
     lines = [
         "[使用CSVログ]",
         f"  選択モード: {mode_label}",
-        f"  選択端末/Player_ID: {selected_device or '(全員・最大4台)'}",
+        f"  選択端末/Player_ID: {selected_device or '(全員・端末ごと最新)'}",
         f"  使用ファイル数: {len(selections)}",
         f"  表示に使ったレコード件数: {chart_record_count if chart_record_count is not None else record_count}",
     ]
@@ -235,11 +236,18 @@ def format_vr_usage_log(
         lines.append(f"  CSVヘッダー一覧: {list(headers)}")
     if player_ids is not None:
         lines.append(f"  検出端末一覧（最大4）: {list(player_ids)[:4]}")
+    lines.append("  --- 選定ファイル詳細 ---")
     for s in selections:
+        try:
+            from app.vr_csv_loader import unique_player_ids
+
+            pids = unique_player_ids(s.df)
+        except Exception:
+            pids = []
         lines.append(
-            f"  - device={s.device_id} name={s.file.name} "
-            f"fileId={s.file.file_id} modifiedTime={s.file.modified_time or '-'} "
-            f"records={s.record_count}"
+            f"  - device={s.device_id} | name={s.file.name} | "
+            f"fileId={s.file.file_id} | modifiedTime={s.file.modified_time or '-'} | "
+            f"records={s.record_count} | Player_IDユニーク={pids}"
         )
     return "\n".join(lines)
 
@@ -490,9 +498,12 @@ with st.sidebar:
     st.markdown("### 📥 取り込み設定")
     import_mode_label = st.radio(
         "分析対象行",
-        options=["新規追加分のみ", "期間指定", "全件（再分析）"],
+        options=["全件（再分析）", "新規追加分のみ", "期間指定"],
         index=0,
-        help="日付未指定時は新規追加分のみ。期間指定時はその期間のデータを抽出します。",
+        help=(
+            "全件（再分析）: 取り込んだCSVをすべて表示（推奨）。"
+            "新規追加分のみ: 過去に取り込み済みの行は除外します（再実行で0行になることがあります）。"
+        ),
     )
     mode_map = {
         "新規追加分のみ": "new_only",
@@ -557,7 +568,7 @@ st.info(
 )
 drive_url = DEFAULT_DRIVE_CSV_URL  # 固定。ユーザー入力の単体 fileId は使わない。
 
-sa_email, sa_ok, expected_sa = get_drive_auth_caption()
+sa_email, sa_ok, expected_sa, sa_error = get_drive_auth_caption()
 if sa_email:
     if sa_ok:
         st.success(f"サービスアカウント認証OK: `{sa_email}`")
@@ -565,6 +576,13 @@ if sa_email:
         st.warning(
             f"サービスアカウントは設定済みですがトークン取得に失敗しています: `{sa_email}`"
         )
+        if sa_error:
+            st.error(f"認証エラー詳細: {sa_error}")
+            st.caption(
+                "Secrets の `private_key` は1行で "
+                '`-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n` '
+                "形式（`\\n` を含む）にしてください。三重引用符の改行でも可。"
+            )
     if sa_email != expected_sa:
         st.warning(
             f"想定メールは `{expected_sa}` です。Secrets の client_email を確認してください。"
@@ -579,6 +597,8 @@ else:
         f"`{expected_sa}` へフォルダを共有してください。"
         "（例: `.streamlit/secrets.toml.example` を参照）"
     )
+    if sa_error:
+        st.caption(f"診断: {sa_error}")
 
 api_key_input = st.text_input(
     "Google API Key（任意・フォールバック）",
@@ -793,10 +813,17 @@ elif do_drive_load:
         for note in result.get("notes") or []:
             st.info(note)
         if result["selected_rows"] == 0:
-            st.warning(
-                "分析対象が 0 件です。すでに取り込み済みか、期間に該当するデータがありません。"
-                "「全件（再分析）」または期間指定を変更してください。"
-            )
+            if import_mode == "new_only":
+                st.warning(
+                    "分析対象が 0 件です。「新規追加分のみ」では、過去に取り込み済みの行は除外されます。"
+                    "これは仕様です。データを表示するには左の取り込み設定で "
+                    "「全件（再分析）」を選んで再度「最新CSVを取り込む」を押してください。"
+                )
+            else:
+                st.warning(
+                    "分析対象が 0 件です。期間に該当するデータがないか、CSVが空です。"
+                    "期間指定を変更するか「全件（再分析）」を試してください。"
+                )
     except Exception as e:
         st.session_state.force_csv_reload = False
         st.error(f"CSVの取得エラー: {e}")

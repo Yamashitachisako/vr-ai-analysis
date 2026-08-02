@@ -3,6 +3,9 @@
 Cloud（Streamlit Secrets）では [gcp_service_account] を使う。
 固定フォルダ 1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9 を
 サービスアカウントの client_email に「閲覧者」で共有すること。
+
+client_email 想定:
+  vr-ai-analysis-drive-reader@routinesupport.iam.gserviceaccount.com
 """
 
 from __future__ import annotations
@@ -17,12 +20,33 @@ logger = logging.getLogger(__name__)
 
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
-# Cloud / 運用で共有済みのサービスアカウント
 EXPECTED_SERVICE_ACCOUNT_EMAIL = (
     "vr-ai-analysis-drive-reader@routinesupport.iam.gserviceaccount.com"
 )
 
-_token_holder: dict[str, Any] = {"creds": None, "fp": ""}
+_token_holder: dict[str, Any] = {"creds": None, "fp": "", "last_error": None}
+
+
+def _section_to_plain_dict(section: Any) -> dict[str, Any]:
+    """Streamlit AttrDict / 通常 dict を素の dict[str, str|Any] に変換。"""
+    out: dict[str, Any] = {}
+    try:
+        keys = list(section.keys())
+    except Exception:
+        if isinstance(section, dict):
+            keys = list(section.keys())
+        else:
+            return out
+    for k in keys:
+        try:
+            v = section[k]
+        except Exception:
+            continue
+        if hasattr(v, "keys") and not isinstance(v, (str, bytes)):
+            out[str(k)] = _section_to_plain_dict(v)
+        else:
+            out[str(k)] = v
+    return out
 
 
 def _from_streamlit_secrets() -> dict[str, Any] | None:
@@ -34,20 +58,24 @@ def _from_streamlit_secrets() -> dict[str, Any] | None:
         return None
 
     try:
-        # secrets.toml が無いとここで失敗する
         keys = list(secrets.keys())
     except Exception:
         return None
 
     try:
         if "gcp_service_account" in keys:
-            return dict(secrets["gcp_service_account"])
+            section = secrets["gcp_service_account"]
+            # セクション全体が JSON 文字列の場合
+            if isinstance(section, str):
+                return json.loads(section)
+            return _section_to_plain_dict(section)
         if "GOOGLE_SERVICE_ACCOUNT_JSON" in keys:
             raw = secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
             if raw:
-                return json.loads(raw) if isinstance(raw, str) else dict(raw)
+                return json.loads(raw) if isinstance(raw, str) else _section_to_plain_dict(raw)
     except Exception as e:
         logger.warning("failed to read service account from secrets: %s", e)
+        _token_holder["last_error"] = f"secrets読み込み失敗: {e}"
     return None
 
 
@@ -58,6 +86,7 @@ def _from_env_or_file() -> dict[str, Any] | None:
             return json.loads(raw)
         except json.JSONDecodeError as e:
             logger.warning("invalid GOOGLE_SERVICE_ACCOUNT_JSON env: %s", e)
+            _token_holder["last_error"] = f"GOOGLE_SERVICE_ACCOUNT_JSON 不正: {e}"
 
     path = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if path and Path(path).is_file():
@@ -65,17 +94,52 @@ def _from_env_or_file() -> dict[str, Any] | None:
             return json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception as e:
             logger.warning("failed to read GOOGLE_APPLICATION_CREDENTIALS: %s", e)
+            _token_holder["last_error"] = f"credentialsファイル読込失敗: {e}"
     return None
 
 
 def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
-    """Streamlit TOML 由来の \\n を実改行に直す。"""
-    key = str(info.get("private_key", ""))
-    if "\\n" in key:
-        out = dict(info)
-        out["private_key"] = key.replace("\\n", "\n")
-        return out
-    return info
+    """Streamlit TOML / Cloud Secrets 由来の private_key を PEM として使える形に直す。"""
+    out = {str(k): v for k, v in info.items()}
+    key = str(out.get("private_key", ""))
+    key = key.strip()
+    # 余分な囲み引用符
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
+        key = key[1:-1].strip()
+    # エスケープ改行を実改行へ（多重エスケープも解消）
+    for _ in range(3):
+        if "\\n" in key:
+            key = key.replace("\\n", "\n")
+        else:
+            break
+    key = key.replace("\r\n", "\n").replace("\r", "\n")
+    # 先頭に付く余計な空白行を整理
+    key = key.strip() + "\n"
+    # BEGIN/END が1行に潰れている場合の最低限の修復はしない（誤修復リスク）
+    if "BEGIN PRIVATE KEY" not in key:
+        logger.warning("private_key に BEGIN PRIVATE KEY が見つかりません")
+    out["private_key"] = key
+
+    for field in (
+        "type",
+        "project_id",
+        "private_key_id",
+        "client_email",
+        "client_id",
+        "token_uri",
+        "auth_uri",
+        "client_x509_cert_url",
+        "auth_provider_x509_cert_url",
+        "universe_domain",
+    ):
+        if field in out and out[field] is not None:
+            out[field] = str(out[field]).strip()
+
+    if not out.get("type"):
+        out["type"] = "service_account"
+    if not out.get("token_uri"):
+        out["token_uri"] = "https://oauth2.googleapis.com/token"
+    return out
 
 
 def load_service_account_info() -> dict[str, Any] | None:
@@ -84,7 +148,9 @@ def load_service_account_info() -> dict[str, Any] | None:
     if not info:
         return None
     if not info.get("client_email") or not info.get("private_key"):
-        logger.warning("service account info missing client_email or private_key")
+        msg = "service account info missing client_email or private_key"
+        logger.warning(msg)
+        _token_holder["last_error"] = msg
         return None
     return _normalize_private_key(info)
 
@@ -97,6 +163,35 @@ def get_service_account_email() -> str | None:
     return email or None
 
 
+def get_last_auth_error() -> str | None:
+    err = _token_holder.get("last_error")
+    return str(err) if err else None
+
+
+def diagnose_service_account() -> dict[str, Any]:
+    """UI / ログ用の診断情報（秘密情報は出さない）。"""
+    info = load_service_account_info()
+    if not info:
+        return {
+            "ok": False,
+            "has_info": False,
+            "error": get_last_auth_error() or "Secrets に [gcp_service_account] がありません",
+        }
+    key = str(info.get("private_key", ""))
+    return {
+        "ok": False,
+        "has_info": True,
+        "client_email": info.get("client_email"),
+        "has_private_key": bool(key),
+        "private_key_has_begin": "BEGIN PRIVATE KEY" in key,
+        "private_key_has_end": "END PRIVATE KEY" in key,
+        "private_key_has_newline": "\n" in key.strip(),
+        "private_key_len": len(key),
+        "has_token_uri": bool(info.get("token_uri")),
+        "error": get_last_auth_error(),
+    }
+
+
 def get_drive_access_token(*, force_refresh: bool = False) -> str | None:
     """サービスアカウントで Drive readonly の access token を取得。"""
     info = load_service_account_info()
@@ -107,19 +202,25 @@ def get_drive_access_token(*, force_refresh: bool = False) -> str | None:
         from google.auth.transport.requests import Request as GoogleAuthRequest
         from google.oauth2 import service_account
     except ImportError as e:
-        logger.error(
-            "google-auth が未インストールです。requirements.txt に google-auth を追加してください: %s",
-            e,
-        )
+        msg = f"google-auth 未インストール: {e}"
+        logger.error(msg)
+        _token_holder["last_error"] = msg
         return None
 
-    fp = f"{info.get('client_email')}:{info.get('private_key_id')}"
+    fp = f"{info.get('client_email')}:{info.get('private_key_id')}:{len(str(info.get('private_key')))}"
     creds = _token_holder.get("creds")
     if force_refresh or _token_holder.get("fp") != fp or creds is None:
-        creds = service_account.Credentials.from_service_account_info(
-            info,
-            scopes=[DRIVE_READONLY_SCOPE],
-        )
+        try:
+            creds = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=[DRIVE_READONLY_SCOPE],
+            )
+        except Exception as e:
+            msg = f"Credentials 作成失敗（private_key形式を確認）: {type(e).__name__}: {e}"
+            logger.warning(msg)
+            _token_holder["last_error"] = msg
+            _token_holder["creds"] = None
+            return None
         _token_holder["creds"] = creds
         _token_holder["fp"] = fp
 
@@ -129,25 +230,36 @@ def get_drive_access_token(*, force_refresh: bool = False) -> str | None:
         elif getattr(creds, "expired", False):
             creds.refresh(GoogleAuthRequest())
     except Exception as e:
-        logger.warning("service account token refresh failed: %s", e)
+        msg = f"token refresh 失敗: {type(e).__name__}: {e}"
+        logger.warning(msg)
+        _token_holder["last_error"] = msg
+        # 壊れた鍵キャッシュを捨てて次回再構築
+        _token_holder["creds"] = None
+        _token_holder["fp"] = ""
         return None
 
     token = getattr(creds, "token", None)
     if token:
+        _token_holder["last_error"] = None
         logger.info("drive service account auth ok email=%s", info.get("client_email"))
+    else:
+        _token_holder["last_error"] = "token が空です"
     return token
 
 
 def auth_status() -> dict[str, Any]:
     """画面表示用の認証状態。"""
+    diag = diagnose_service_account()
     email = get_service_account_email()
     token_ok = False
-    error = None
+    error = diag.get("error")
     if email:
         try:
             token_ok = bool(get_drive_access_token())
+            error = get_last_auth_error()
         except Exception as e:
             error = str(e)
+            _token_holder["last_error"] = error
     return {
         "configured": bool(email),
         "client_email": email,
@@ -157,5 +269,6 @@ def auth_status() -> dict[str, Any]:
         ),
         "token_ok": token_ok,
         "error": error,
+        "diagnosis": diag,
         "folder_id": "1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9",
     }

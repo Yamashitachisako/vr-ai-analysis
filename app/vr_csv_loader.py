@@ -167,12 +167,40 @@ def read_csv_bytes(content: bytes) -> pd.DataFrame:
     raise ValueError(f"CSVの読み込みに失敗しました: {last_error}")
 
 
+def device_key_from_filename(name: str) -> str | None:
+    """ファイル名 Log_<端末>_YYYYMMDD_HHMMSS.csv から端末キーを抽出。"""
+    base = Path(name or "").name
+    m = re.match(
+        r"^Log_(.+)_((?:19|20)\d{6})_(\d{6})\.csv$",
+        base,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"^Log_(.+)\.csv$", base, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def infer_device_id(file_info: CsvFileInfo, df: pd.DataFrame) -> str:
-    """CSV の Player_ID 値をそのまま返す（A/B 等へ置換しない）。"""
+    """端末識別子。Player_ID の値は置き換えない。
+
+    優先順:
+      1. CSV内 Player_ID が1種類 → その値（CSVどおり）
+      2. ファイル名の端末キー（Log_<端末>_日時.csv）
+      3. Player_ID の最頻値（CSVどおり）
+      4. UNKNOWN
+    """
     players = unique_player_ids(df)
     if len(players) == 1:
         return players[0]
-    if len(players) > 1:
+
+    from_name = device_key_from_filename(file_info.name)
+    if from_name:
+        return from_name
+
+    if len(players) > 1 and "Player_ID" in df.columns:
         mode = df["Player_ID"].dropna().astype(str).str.strip().mode()
         if not mode.empty:
             return str(mode.iloc[0]).strip()
@@ -258,10 +286,15 @@ def _load_file_content(info: CsvFileInfo) -> tuple[bytes, str | None]:
 def select_latest_csv_per_device(
     candidates: list[CsvFileInfo],
     *,
-    max_downloads: int = 40,
+    max_downloads: int = 80,
     max_devices: int = EXPECTED_VR_DEVICE_COUNT,
 ) -> tuple[dict[str, DeviceCsvSelection], str]:
-    """候補を modifiedTime 新しい順に読み、端末ごとに最新1件を選ぶ（最大4台）。"""
+    """端末（ファイル名キー / Player_ID）ごとに modifiedTime 最新の1件を選ぶ。
+
+    「フォルダ内の最新4件を単純取得」ではない。
+    1) ファイル名 Log_<端末>_日時.csv でグループ化し、各グループの最新を候補にする
+    2) 足りなければ modifiedTime 新しい順に内容の Player_ID で補完する
+    """
     if not candidates:
         raise FileNotFoundError("CSVファイルが見つかりませんでした。")
 
@@ -269,16 +302,42 @@ def select_latest_csv_per_device(
     log_lines = [
         "[VR端末別 最新CSV選定]",
         f"  想定端末数={max_devices} / 候補総数={len(ranked)} / "
-        f"読み込み上限={max_downloads}（modifiedTime新しい順）",
+        f"読み込み上限={max_downloads}",
+        "  方式: ファイル名端末キーごと最新 → Player_ID で補完（単純な最新4件ではない）",
     ]
+
+    # --- 1) ファイル名キーでグループ化し、各キー最新1件 ---
+    by_name_key: dict[str, CsvFileInfo] = {}
+    no_key: list[CsvFileInfo] = []
+    for info in ranked:
+        key = device_key_from_filename(info.name)
+        if not key:
+            no_key.append(info)
+            continue
+        # ranked は新しい順なので、先勝ち = そのキーの最新
+        if key not in by_name_key:
+            by_name_key[key] = info
+
+    # 端末キーの「新しさ」で上位 max_devices を優先ダウンロード
+    name_groups_ranked = sorted(
+        by_name_key.items(),
+        key=lambda kv: kv[1].sort_key,
+        reverse=True,
+    )
+    priority_files = [info for _, info in name_groups_ranked[:max_devices]]
+    # 補完用に残りも後ろへ
+    priority_ids = {f.file_id for f in priority_files}
+    rest_files = [f for f in ranked if f.file_id not in priority_ids]
 
     selections: dict[str, DeviceCsvSelection] = {}
     inspected = 0
-    for info in ranked:
+
+    def _consume(info: CsvFileInfo) -> None:
+        nonlocal inspected
         if len(selections) >= max_devices:
-            break
+            return
         if inspected >= max_downloads and selections:
-            break
+            return
         inspected += 1
         try:
             content, _ = _load_file_content(info)
@@ -286,16 +345,19 @@ def select_latest_csv_per_device(
         except Exception as e:
             log_lines.append(f"  skip name={info.name} fileId={info.file_id} error={e}")
             logger.warning("skip csv name=%s error=%s", info.name, e)
-            continue
+            return
 
         device_id = infer_device_id(info, df)
+        players_in_file = unique_player_ids(df)
         log_lines.append(
             f"  検査: name={info.name} fileId={info.file_id} "
-            f"modifiedTime={info.modified_time or '-'} device={device_id} rows={len(df)}"
+            f"modifiedTime={info.modified_time or '-'} "
+            f"device={device_id} rows={len(df)} "
+            f"Player_IDユニーク={players_in_file}"
         )
         if device_id in selections:
-            # すでに新しい順で選済みのため、後続は古い
-            continue
+            log_lines.append(f"  (skip) device={device_id} はより新しいCSVで確定済み")
+            return
 
         selections[device_id] = DeviceCsvSelection(
             device_id=device_id,
@@ -305,24 +367,38 @@ def select_latest_csv_per_device(
         )
         log_latest_csv_selection(info, [info])
         log_lines.append(
-            f"  --> 端末 {device_id} の最新: {info.name} | "
-            f"fileId={info.file_id} | modifiedTime={info.modified_time or '-'} | "
-            f"records={len(df)}"
+            f"  --> 確定 device={device_id} name={info.name} "
+            f"fileId={info.file_id} modifiedTime={info.modified_time or '-'} "
+            f"records={len(df)} Player_IDユニーク={players_in_file}"
         )
+
+    log_lines.append(f"  ファイル名グループ数={len(by_name_key)} / 優先ダウンロード={len(priority_files)}")
+    for info in priority_files:
+        _consume(info)
+        if len(selections) >= max_devices:
+            break
+
+    if len(selections) < max_devices:
+        log_lines.append("  Player_ID/追加スキャンで補完中...")
+        for info in rest_files + no_key:
+            _consume(info)
+            if len(selections) >= max_devices:
+                break
 
     if not selections:
         raise FileNotFoundError("端末ごとの最新CSVを特定できませんでした。")
 
-    if len(selections) > max_devices:
-        # 念のため truncate（通常はループで止まる）
-        keep = sorted(selections.items(), key=lambda x: x[1].file.sort_key, reverse=True)[
-            :max_devices
-        ]
-        selections = dict(keep)
+    # 詳細確定ログ
+    log_lines.append(f"  確定端末数={len(selections)} / 端末一覧={sorted(selections.keys(), key=str.lower)}")
+    log_lines.append("  [確定CSV一覧]")
+    for device_id, sel in sorted(selections.items(), key=lambda x: str(x[0]).lower()):
+        pids = unique_player_ids(sel.df)
+        log_lines.append(
+            f"  - device={device_id} | name={sel.file.name} | "
+            f"fileId={sel.file.file_id} | modifiedTime={sel.file.modified_time or '-'} | "
+            f"records={sel.record_count} | Player_IDユニーク={pids}"
+        )
 
-    log_lines.append(
-        f"  確定端末数={len(selections)} / 端末一覧={sorted(selections.keys(), key=str.lower)}"
-    )
     selection_log = "\n".join(log_lines)
     for line in log_lines:
         logger.info(line)
@@ -363,22 +439,24 @@ def format_usage_log(
     player_ids: list[str],
     record_count: int,
 ) -> str:
-    mode_label = "全員（最大4台の最新CSVを統合）" if mode == "all" else "個人（1台の最新CSV）"
+    mode_label = "全員（端末ごと最新CSVを統合）" if mode == "all" else "個人（1台の最新CSV）"
     lines = [
         "[使用CSVログ]",
         f"  選択モード: {mode_label}",
-        f"  選択端末/Player_ID: {selected_device or '(全員・最大4台)'}",
+        f"  選択端末/Player_ID: {selected_device or '(全員・端末ごと最新)'}",
         f"  使用ファイル数: {len(selections)} / 想定最大 {EXPECTED_VR_DEVICE_COUNT}",
         f"  検出端末一覧: {player_ids}",
         f"  CSVヘッダー一覧: {headers}",
         f"  表示に使ったレコード件数: {record_count}",
         f"  folderId: {DEFAULT_DRIVE_FOLDER_ID}",
+        "  --- 選定ファイル詳細 ---",
     ]
     for s in selections:
+        pids = unique_player_ids(s.df)
         lines.append(
-            f"  - device={s.device_id} name={s.file.name} "
-            f"fileId={s.file.file_id} modifiedTime={s.file.modified_time or '-'} "
-            f"records={s.record_count}"
+            f"  - device={s.device_id} | name={s.file.name} | "
+            f"fileId={s.file.file_id} | modifiedTime={s.file.modified_time or '-'} | "
+            f"records={s.record_count} | Player_IDユニーク={pids}"
         )
     return "\n".join(lines)
 
