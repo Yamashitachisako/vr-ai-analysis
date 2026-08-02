@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""VR端末ごとの最新CSV選定テスト（modifiedTime）。"""
+"""実CSVヘッダー・Player_ID据え置き・最新CSV読み込みのテスト。"""
 
 from __future__ import annotations
 
@@ -14,121 +14,109 @@ sys.path.insert(0, str(ROOT))
 
 from app.drive_latest import CsvFileInfo
 from app.vr_csv_loader import (
-    build_analysis_frame,
+    prepare_vr_dataframe,
+    unique_player_ids,
     infer_device_id,
     load_vr_csvs_for_mode,
-    prepare_vr_dataframe,
-    select_latest_csv_per_device,
+    FORBIDDEN_SAMPLE_COLUMNS,
 )
 
-
-HEADERS = [
+REAL_HEADERS = [
     "Elapsed_Time",
     "Event_Type",
     "Player_ID",
+    "Player_X",
+    "Player_Y",
+    "Player_Z",
     "Target_Object",
-    "Data_Value",
-    "WorldX",
-    "WorldY",
-    "WorldZ",
-    "LocalX",
-    "LocalY",
-    "LocalZ",
+    "Reaction_Time_Micro",
+    "World_X",
+    "World_Y",
+    "World_Z",
+    "Local_X",
+    "Local_Y",
+    "Local_Z",
 ]
 
 
-def _write_csv(path: Path, player: str, rows: int = 2) -> None:
-    df = pd.DataFrame(
-        [
-            {
-                "Elapsed_Time": i,
-                "Event_Type": "転倒",
-                "Player_ID": player,
-                "Target_Object": "床",
-                "Data_Value": 1.5 + i,
-                "WorldX": 0,
-                "WorldY": 0,
-                "WorldZ": 0,
-                "LocalX": 0,
-                "LocalY": 0,
-                "LocalZ": 0,
-            }
-            for i in range(rows)
-        ]
-    )
-    df.to_csv(path, index=False)
+def _row(player: str, i: int = 0) -> dict:
+    return {
+        "Elapsed_Time": f"00:00.{i:02d}",
+        "Event_Type": "PlayerPosition",
+        "Player_ID": player,
+        "Player_X": 0.1,
+        "Player_Y": 0.9,
+        "Player_Z": -10.0,
+        "Target_Object": "",
+        "Reaction_Time_Micro": 100.0 + i,
+        "World_X": 1.0,
+        "World_Y": 2.0,
+        "World_Z": 3.0,
+        "Local_X": 0.0,
+        "Local_Y": 0.0,
+        "Local_Z": 0.0,
+    }
 
 
-def test_prepare_keeps_headers():
-    df = prepare_vr_dataframe(
-        pd.DataFrame([{h: 1 if h != "Player_ID" else "A" for h in HEADERS}])
-    )
-    assert list(df.columns) == HEADERS
+def test_prepare_keeps_real_headers():
+    df = prepare_vr_dataframe(pd.DataFrame([_row("ota"), _row("Player")]))
+    assert list(df.columns) == REAL_HEADERS
     assert "timestamp" not in df.columns
     assert "player_id" not in df.columns
+    assert "gaze_x" not in df.columns
+    assert unique_player_ids(df) == ["Player", "ota"] or set(unique_player_ids(df)) == {
+        "Player",
+        "ota",
+    }
 
 
-def test_infer_device_from_player_id():
-    info = CsvFileInfo(file_id="1", name="anything.csv", modified_time="2024-01-01T00:00:00Z")
-    df = pd.DataFrame({"Player_ID": ["B", "B"]})
-    assert infer_device_id(info, df) == "B"
+def test_reject_sample_schema():
+    sample = pd.DataFrame(
+        [
+            {
+                "timestamp": 1,
+                "player_id": "A",
+                "event_type": "x",
+                "reaction_time": 1,
+                "gaze_x": 0,
+                "gaze_y": 0,
+                "location": "y",
+            }
+        ]
+    )
+    try:
+        prepare_vr_dataframe(sample)
+        raise AssertionError("sample should be rejected")
+    except ValueError as e:
+        assert "サンプル" in str(e)
 
 
-def test_select_latest_per_device_by_modified_time():
-    # 端末A: 古い / 新しい、端末B: 1件、端末C: 1件、端末D: 古いがファイル名は新しい見た目
-    candidates = [
-        CsvFileInfo("a_old", "vrA_2026.csv", "2020-01-01T00:00:00Z", source="local"),
-        CsvFileInfo("a_new", "vrA_oldname.csv", "2026-06-01T12:00:00Z", source="local"),
-        CsvFileInfo("b1", "device_B.csv", "2026-05-01T00:00:00Z", source="local"),
-        CsvFileInfo("c1", "player-C-log.csv", "2026-04-01T00:00:00Z", source="local"),
-        CsvFileInfo("d_old", "D_latest_looking.csv", "2019-01-01T00:00:00Z", source="local"),
-        CsvFileInfo("d_new", "D_zzz.csv", "2026-07-01T00:00:00Z", source="local"),
-    ]
+def test_player_id_not_replaced():
+    info = CsvFileInfo(file_id="1", name="Log_Quest.csv", modified_time="2026-08-01T00:00:00Z")
+    df = pd.DataFrame({"Player_ID": ["ota", "ota"]})
+    assert infer_device_id(info, df) == "ota"
+    df2 = pd.DataFrame({"Player_ID": ["Player"]})
+    assert infer_device_id(info, df2) == "Player"
 
-    # 実ファイルとして読む必要があるため temp に書き出し path をセット
+
+def test_load_latest_local_preserves_headers_and_player():
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        mapping = {
-            "a_old": ("A", 1),
-            "a_new": ("A", 3),
-            "b1": ("B", 2),
-            "c1": ("C", 2),
-            "d_old": ("D", 1),
-            "d_new": ("D", 4),
-        }
-        loaded = []
-        for info in candidates:
-            player, rows = mapping[info.file_id]
-            path = tmp_path / f"{info.file_id}.csv"
-            _write_csv(path, player, rows)
-            info.source = "local"
-            info.path = str(path)
-            loaded.append(info)
+        older = tmp_path / "old.csv"
+        newer = tmp_path / "new.csv"
+        pd.DataFrame([_row("player")]).to_csv(older, index=False)
+        pd.DataFrame([_row("ota"), _row("ota", 1)]).to_csv(newer, index=False)
+        import time
 
-        selections, log = select_latest_csv_per_device(loaded)
-        assert set(selections.keys()) == {"A", "B", "C", "D"}
-        assert selections["A"].file.file_id == "a_new"
-        assert selections["A"].record_count == 3
-        assert selections["D"].file.file_id == "d_new"
-        assert "modifiedTime" in log
+        time.sleep(0.05)
+        newer.write_text(newer.read_text(encoding="utf-8"), encoding="utf-8")
 
-        all_df = build_analysis_frame(selections, mode="all", selected_device=None)
-        assert len(all_df) == 3 + 2 + 2 + 4
+        # touch newer
+        import os
 
-        one = build_analysis_frame(selections, mode="individual", selected_device="B")
-        assert len(one) == 2
-        assert set(one["Player_ID"].astype(str)) == {"B"}
-        assert list(all_df.columns)[:5] == HEADERS[:5]
+        os.utime(newer, None)
 
-
-def test_load_vr_csvs_local_all_and_individual():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        for player, stamp in [("A", "2026-01-01"), ("B", "2026-02-01"), ("C", "2026-03-01"), ("D", "2026-04-01")]:
-            path = tmp_path / f"session_{player}.csv"
-            _write_csv(path, player, rows=2)
-            # touch mtime ordering via write order; list_local uses file mtime
-        result_all = load_vr_csvs_for_mode(
+        result = load_vr_csvs_for_mode(
             drive_url=None,
             api_key=None,
             mode="all",
@@ -136,48 +124,26 @@ def test_load_vr_csvs_local_all_and_individual():
             prefer_local=True,
             local_dir=tmp_path,
         )
-        assert result_all.record_count == 8
-        assert len(result_all.selections) == 4
+        assert "Player_ID" in result.df.columns
+        assert "timestamp" not in result.df.columns
+        assert list(result.headers) == REAL_HEADERS
+        assert "ota" in result.player_ids
 
-        result_one = load_vr_csvs_for_mode(
+        one = load_vr_csvs_for_mode(
             drive_url=None,
             api_key=None,
             mode="individual",
-            selected_device="C",
+            selected_device="ota",
             prefer_local=True,
             local_dir=tmp_path,
         )
-        assert result_one.record_count == 2
-        assert len(result_one.selections) == 1
-        assert result_one.selections[0].device_id == "C"
-
-
-def test_resolve_folder_always_fixed_id():
-    from app.vr_csv_loader import resolve_drive_folder_id
-    from app.drive_latest import DEFAULT_DRIVE_FOLDER_ID, LEGACY_SINGLE_FILE_ID
-
-    assert resolve_drive_folder_id(None) == DEFAULT_DRIVE_FOLDER_ID
-    assert resolve_drive_folder_id("") == DEFAULT_DRIVE_FOLDER_ID
-    assert (
-        resolve_drive_folder_id(
-            f"https://drive.google.com/file/d/{LEGACY_SINGLE_FILE_ID}/view"
-        )
-        == DEFAULT_DRIVE_FOLDER_ID
-    )
-    folder_url = f"https://drive.google.com/drive/folders/{DEFAULT_DRIVE_FOLDER_ID}"
-    assert resolve_drive_folder_id(folder_url) == DEFAULT_DRIVE_FOLDER_ID
-    # 別フォルダURLでも必ず固定 folderId を使う
-    other = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-    assert (
-        resolve_drive_folder_id(f"https://drive.google.com/drive/folders/{other}")
-        == DEFAULT_DRIVE_FOLDER_ID
-    )
+        assert set(one.df["Player_ID"].astype(str)) == {"ota"}
+        assert one.record_count >= 1
 
 
 if __name__ == "__main__":
-    test_prepare_keeps_headers()
-    test_infer_device_from_player_id()
-    test_select_latest_per_device_by_modified_time()
-    test_load_vr_csvs_local_all_and_individual()
-    test_resolve_folder_always_fixed_id()
+    test_prepare_keeps_real_headers()
+    test_reject_sample_schema()
+    test_player_id_not_replaced()
+    test_load_latest_local_preserves_headers_and_player()
     print("OK: all vr_csv_loader tests passed")

@@ -15,7 +15,7 @@ FONT = "HeiseiKakuGo-W5"
 
 
 def _value_series(df: pd.DataFrame) -> pd.Series:
-    for col in ("Data_Value", "data_value", "reaction_time"):
+    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value", "data_value"):
         if col in df.columns:
             return pd.to_numeric(df[col], errors="coerce").dropna()
     return pd.Series(dtype=float)
@@ -61,8 +61,16 @@ def build_analysis_comment(df: pd.DataFrame) -> str:
 
     values = _value_series(df)
     if not values.empty:
+        col_name = next(
+            (
+                c
+                for c in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value")
+                if c in df.columns
+            ),
+            "値",
+        )
         parts.append(
-            f"Data_Value の平均は {values.mean():.2f}、"
+            f"{col_name} の平均は {values.mean():.2f}、"
             f"最小 {values.min():.2f}、最大 {values.max():.2f} です。"
         )
 
@@ -145,7 +153,15 @@ def build_pdf_bytes(df: pd.DataFrame) -> bytes:
 
     values = _value_series(df)
     if not values.empty:
-        elements.append(Paragraph("Data_Value 基本統計", heading_style))
+        col_name = next(
+            (
+                c
+                for c in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value")
+                if c in df.columns
+            ),
+            "値",
+        )
+        elements.append(Paragraph(f"{col_name} 基本統計", heading_style))
         stats_table = [
             ["統計量", "値"],
             ["件数", str(len(values))],

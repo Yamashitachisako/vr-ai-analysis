@@ -1,4 +1,4 @@
-"""実CSVヘッダー名（Elapsed_Time / Event_Type 等）でグラフ・KPIを描画。"""
+"""実CSVヘッダー名でグラフ・KPIを描画（列名はリネームしない）。"""
 
 from __future__ import annotations
 
@@ -22,16 +22,24 @@ EVENT_COLORS = {
 }
 
 
-def get_event_color(event_type) -> str:
-    return EVENT_COLORS.get(str(event_type), "#3498db")
+def value_column(df: pd.DataFrame) -> str | None:
+    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value"):
+        if col in df.columns:
+            return col
+    return None
 
 
 def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     """フィルター後の DataFrame を返し、表・KPI・グラフを描画する。"""
+    value_col = value_column(df)
+
     with st.sidebar:
         st.markdown("### 🔍 データフィルター")
         if "Player_ID" in df.columns:
-            players = ["全員"] + sorted(df["Player_ID"].dropna().astype(str).unique().tolist())
+            players = ["全員"] + sorted(
+                df["Player_ID"].dropna().astype(str).unique().tolist(),
+                key=lambda x: x.lower(),
+            )
             selected_player = st.selectbox("Player_ID", players, key="filter_player_id")
         else:
             selected_player = "全員"
@@ -43,7 +51,9 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
             selected_event = "全て"
 
         if "Target_Object" in df.columns:
-            targets = ["全て"] + sorted(df["Target_Object"].dropna().astype(str).unique().tolist())
+            targets = ["全て"] + sorted(
+                df["Target_Object"].dropna().astype(str).unique().tolist()
+            )
             selected_target = st.selectbox("Target_Object", targets, key="filter_target_object")
         else:
             selected_target = "全て"
@@ -57,6 +67,7 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
         filtered = filtered[filtered["Target_Object"].astype(str) == selected_target]
 
     st.markdown('<div class="section-header">📋 データプレビュー</div>', unsafe_allow_html=True)
+    st.caption(f"列名（CSVヘッダー）: {list(filtered.columns)}")
     st.dataframe(filtered, use_container_width=True, height=250)
 
     st.markdown('<div class="section-header">📊 基本情報</div>', unsafe_allow_html=True)
@@ -72,43 +83,47 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     c1.metric("総レコード数", f"{total_rows} 件")
     c2.metric("Event_Type件数", f"{len(event_rows)} 件")
 
-    if "Data_Value" in filtered.columns:
-        vals = filtered["Data_Value"].replace(0, pd.NA).dropna()
-        c3.metric("Data_Value平均", f"{vals.mean():.2f}" if not vals.empty else "N/A")
-        c4.metric("Data_Value最大", f"{vals.max():.2f}" if not vals.empty else "N/A")
-        c5.metric("Data_Value最小", f"{vals.min():.2f}" if not vals.empty else "N/A")
+    if value_col and value_col in filtered.columns:
+        vals = pd.to_numeric(filtered[value_col], errors="coerce").dropna()
+        label = value_col
+        c3.metric(f"{label}平均", f"{vals.mean():.2f}" if not vals.empty else "N/A")
+        c4.metric(f"{label}最大", f"{vals.max():.2f}" if not vals.empty else "N/A")
+        c5.metric(f"{label}最小", f"{vals.min():.2f}" if not vals.empty else "N/A")
     else:
-        c3.metric("Data_Value平均", "N/A")
-        c4.metric("Data_Value最大", "N/A")
-        c5.metric("Data_Value最小", "N/A")
+        c3.metric("数値列", "N/A")
+        c4.metric("数値列", "N/A")
+        c5.metric("数値列", "N/A")
 
     try:
-        st.markdown('<div class="section-header">📈 Data_Value / Event_Type</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="section-header">📈 {value_col or "Value"} / Event_Type</div>',
+            unsafe_allow_html=True,
+        )
         a, b = st.columns(2)
         with a:
-            if "Data_Value" in filtered.columns and "Elapsed_Time" in filtered.columns:
-                plot_df = filtered.dropna(subset=["Data_Value", "Elapsed_Time"]).copy()
+            if value_col and "Elapsed_Time" in filtered.columns:
+                plot_df = filtered.copy()
+                plot_df[value_col] = pd.to_numeric(plot_df[value_col], errors="coerce")
+                plot_df = plot_df.dropna(subset=[value_col])
                 if not plot_df.empty:
                     fig = px.line(
-                        plot_df,
-                        x="Elapsed_Time",
-                        y="Data_Value",
+                        plot_df.reset_index(drop=True).reset_index(),
+                        x="index",
+                        y=value_col,
                         color="Event_Type" if "Event_Type" in plot_df.columns else None,
                         color_discrete_map=EVENT_COLORS,
-                        title="Elapsed_Time に対する Data_Value",
-                        labels={
-                            "Elapsed_Time": "Elapsed_Time",
-                            "Data_Value": "Data_Value",
-                            "Event_Type": "Event_Type",
-                        },
+                        title=f"レコード順の {value_col}",
+                        labels={"index": "index", value_col: value_col, "Event_Type": "Event_Type"},
                     )
                     fig.update_layout(height=350)
                     st.plotly_chart(fig, use_container_width=True)
         with b:
-            if "Event_Type" in filtered.columns and "Data_Value" in filtered.columns:
+            if value_col and "Event_Type" in filtered.columns:
+                tmp = filtered.copy()
+                tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
                 avg = (
-                    filtered.dropna(subset=["Data_Value"])
-                    .groupby("Event_Type")["Data_Value"]
+                    tmp.dropna(subset=[value_col])
+                    .groupby("Event_Type")[value_col]
                     .mean()
                     .reset_index()
                 )
@@ -117,26 +132,31 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
                     fig = px.bar(
                         avg,
                         x="Event_Type",
-                        y="Data_Value",
+                        y=value_col,
                         color="Event_Type",
                         color_discrete_map=EVENT_COLORS,
-                        title="Event_Type別 Data_Value平均",
-                        labels={"Event_Type": "Event_Type", "Data_Value": "Data_Value"},
+                        title=f"Event_Type別 {value_col}平均",
+                        labels={"Event_Type": "Event_Type", value_col: value_col},
                     )
                     fig.update_layout(height=350, showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
-        st.warning(f"Data_Value / Event_Type グラフエラー: {e}")
+        st.warning(f"グラフエラー: {e}")
         logger.exception("chart error")
 
     try:
         c, d = st.columns(2)
         with c:
-            st.markdown('<div class="section-header">👤 Player_ID別 Data_Value</div>', unsafe_allow_html=True)
-            if "Player_ID" in filtered.columns and "Data_Value" in filtered.columns:
+            st.markdown(
+                f'<div class="section-header">👤 Player_ID別 {value_col or ""}</div>',
+                unsafe_allow_html=True,
+            )
+            if value_col and "Player_ID" in filtered.columns:
+                tmp = filtered.copy()
+                tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
                 avg = (
-                    filtered.dropna(subset=["Data_Value"])
-                    .groupby("Player_ID")["Data_Value"]
+                    tmp.dropna(subset=[value_col])
+                    .groupby("Player_ID")[value_col]
                     .mean()
                     .reset_index()
                 )
@@ -144,15 +164,18 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
                     fig = px.bar(
                         avg,
                         x="Player_ID",
-                        y="Data_Value",
+                        y=value_col,
                         color="Player_ID",
-                        title="Player_ID別 Data_Value平均",
-                        labels={"Player_ID": "Player_ID", "Data_Value": "Data_Value"},
+                        title=f"Player_ID別 {value_col}平均",
+                        labels={"Player_ID": "Player_ID", value_col: value_col},
                     )
                     fig.update_layout(height=350, showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
         with d:
-            st.markdown('<div class="section-header">📍 Target_Object × Event_Type</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-header">📍 Target_Object × Event_Type</div>',
+                unsafe_allow_html=True,
+            )
             if "Target_Object" in filtered.columns and "Event_Type" in filtered.columns:
                 loc = filtered[
                     filtered["Event_Type"].notna() & (filtered["Event_Type"].astype(str) != "None")
@@ -178,13 +201,17 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
         st.warning(f"Player_ID / Target_Object グラフエラー: {e}")
 
     try:
-        st.markdown('<div class="section-header">📊 Event_Type / Target_Object 集計</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-header">📊 Event_Type / Target_Object 集計</div>',
+            unsafe_allow_html=True,
+        )
         e, f = st.columns(2)
         with e:
             if "Event_Type" in filtered.columns:
                 counts = (
                     filtered[
-                        filtered["Event_Type"].notna() & (filtered["Event_Type"].astype(str) != "None")
+                        filtered["Event_Type"].notna()
+                        & (filtered["Event_Type"].astype(str) != "None")
                     ]
                     .groupby("Event_Type")
                     .size()
@@ -224,31 +251,6 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
                     )
                     fig.update_layout(height=350, showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
-
-        if "Data_Value" in filtered.columns:
-            dv = filtered.copy()
-            dv["Data_Value"] = pd.to_numeric(dv["Data_Value"], errors="coerce")
-            dv = dv[dv["Data_Value"].notna()]
-            if not dv.empty:
-                x_col = "Elapsed_Time" if "Elapsed_Time" in dv.columns else None
-                if x_col is None:
-                    dv = dv.reset_index()
-                    x_col = "index"
-                fig = px.line(
-                    dv,
-                    x=x_col,
-                    y="Data_Value",
-                    color="Event_Type" if "Event_Type" in dv.columns else None,
-                    color_discrete_map=EVENT_COLORS,
-                    title="Data_Valueの推移",
-                    labels={
-                        x_col: "Elapsed_Time" if x_col == "Elapsed_Time" else "index",
-                        "Data_Value": "Data_Value",
-                        "Event_Type": "Event_Type",
-                    },
-                )
-                fig.update_layout(height=350)
-                st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
         st.warning(f"集計グラフエラー: {e}")
 
