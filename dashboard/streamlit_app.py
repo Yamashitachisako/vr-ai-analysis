@@ -1,5 +1,6 @@
 import re
 import sys
+import os
 import logging
 from pathlib import Path
 
@@ -131,14 +132,34 @@ DEFAULT_DRIVE_CSV_URL = (
     "https://drive.google.com/file/d/10s13cnRpNdIpdR4Gaeez5sCaewonj1a9/view?usp=sharing"
 )
 
+def reset_load_state() -> None:
+    """アップロード／Drive取得前に前回の選択・キャッシュをクリアする。"""
+    st.session_state.df = None
+    st.session_state.import_meta = None
+    st.session_state.pdf_bytes = None
+    st.session_state.pdf_error = None
+    st.session_state.last_upload_key = None
+    st.session_state.latest_csv_info = None
+    logger.info("load state reset before fetching latest CSV")
+
+
+def get_google_api_key() -> str | None:
+    key = ""
+    try:
+        key = st.secrets.get("GOOGLE_API_KEY", "")  # type: ignore[attr-defined]
+    except Exception:
+        key = ""
+    if not key:
+        key = os.environ.get("GOOGLE_API_KEY", "")
+    key = (key or "").strip()
+    return key or None
+
+
 def extract_google_drive_file_id(url: str) -> str:
-    match = re.search(r"/file/d/([^/]+)", url)
-    if match:
-        return match.group(1)
-    match = re.search(r"[?&]id=([^&]+)", url)
-    if match:
-        return match.group(1)
-    return url.strip()
+    from app.drive_latest import extract_drive_file_id
+
+    fid = extract_drive_file_id(url)
+    return fid or url.strip()
 
 def to_google_drive_download_url(url: str) -> str:
     """共有リンクを pandas で読み込めるダウンロードURLに変換する。"""
@@ -207,13 +228,29 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_csv_from_upload(uploaded_file) -> pd.DataFrame:
     return standardize_columns(read_csv_robust(uploaded_file.getvalue()))
 
-def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
-    """Drive URL から (content, file_id, modified_time) を返す。"""
-    file_id = extract_google_drive_file_id(url)
-    download_url = to_google_drive_download_url(url)
-    from app.incremental_loader import download_drive_content
+def load_latest_csv_for_analysis(
+    *,
+    drive_url: str,
+    api_key: str | None,
+    prefer_local: bool = False,
+) -> dict:
+    """毎回一覧を再取得し、最新CSVのみを読み込む。"""
+    from app.drive_latest import resolve_latest_csv_from_source
 
-    content, modified = download_drive_content(download_url)
+    info, content = resolve_latest_csv_from_source(
+        drive_url=drive_url,
+        api_key=api_key,
+        prefer_local=prefer_local,
+    )
+    raw = standardize_columns(read_csv_robust(content))
+    return {"info": info, "content": content, "raw": raw}
+
+def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
+    """互換用: 単一ファイルURLから取得。"""
+    from app.drive_latest import download_drive_file, extract_drive_file_id
+
+    file_id = extract_drive_file_id(url) or url.strip()
+    content, modified = download_drive_file(file_id)
     return content, file_id, modified
 
 def load_csv_from_google_drive(url: str) -> pd.DataFrame:
@@ -339,77 +376,129 @@ with st.sidebar:
 
 # CSV読み込み（ログイン後・メインエリア上部に常時表示）
 st.markdown('<div class="section-header">📂 データ読み込み</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("CSVをアップロード", type=["csv"])
+st.caption(
+    "「取り込む」ボタンを押すたびにCSV一覧を再取得し、"
+    "**最終更新日時が最も新しいCSVだけ**を分析対象にします。"
+)
 
-st.markdown("**Google Driveから読み込む**")
-drive_url = st.text_input("Google DriveのCSVリンク", value=DEFAULT_DRIVE_CSV_URL)
+uploaded_files = st.file_uploader(
+    "CSVをアップロード（複数可・最新のみ使用）",
+    type=["csv"],
+    accept_multiple_files=True,
+    key="csv_uploader",
+)
+load_from_upload = st.button(
+    "アップロードした最新CSVを取り込む",
+    use_container_width=True,
+    key="load_from_upload_btn",
+)
+
+st.markdown("**Google Drive / ローカルから最新CSVを取り込む**")
+drive_url = st.text_input(
+    "Google DriveのフォルダまたはファイルURL",
+    value=DEFAULT_DRIVE_CSV_URL,
+    help="フォルダURLなら中の最新CSVを自動選択。ファイルURLならそのファイルを毎回新規取得します。",
+)
+api_key_input = st.text_input(
+    "Google API Key（任意・フォルダ一覧用）",
+    value="",
+    type="password",
+    help="フォルダ内のCSV一覧取得に使います。未設定でも公開フォルダの取得を試みます。",
+)
+prefer_local = st.checkbox("ローカル data/input の最新CSVを優先する", value=False)
 load_from_drive = st.button(
-    "Google Driveから読み込む",
+    "最新CSVを取り込む",
     type="primary",
     use_container_width=True,
     key="load_from_drive_btn",
 )
 st.markdown("---")
 
-if uploaded_file is not None:
-    upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
-    if st.session_state.get("last_upload_key") != upload_key:
-        try:
-            raw = load_csv_from_upload(uploaded_file)
-            content = uploaded_file.getvalue()
-            file_id = f"upload:{uploaded_file.name}"
-            result = apply_import_policy(
-                raw,
-                file_id=file_id,
-                file_name=uploaded_file.name,
-                content=content,
-                modified_time=None,
-                mode=import_mode,
-                start_date=start_date,
-                end_date=end_date,
-                date_column=date_column_override.strip() or None,
-            )
-            st.session_state.df = result["df"]
-            st.session_state.import_meta = result
-            st.session_state.pdf_bytes = None
-            st.session_state.pdf_error = None
-            st.session_state.last_upload_key = upload_key
-            st.success(
-                f"アップロード完了: 全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
-                f"（モード: {result['mode']}）"
-            )
-            for note in result.get("notes") or []:
-                st.info(note)
-        except Exception as e:
-            st.error(f"CSVの読み込みエラー: {e}")
-            logger.exception("upload load failed")
-elif load_from_drive and drive_url.strip():
+if load_from_upload:
     try:
-        with st.spinner("Google Driveから読み込み中..."):
-            content, file_id, modified = load_csv_bytes_from_google_drive(drive_url.strip())
-            raw = standardize_columns(read_csv_robust(content))
+        reset_load_state()
+        if not uploaded_files:
+            raise FileNotFoundError("CSVが選択されていません。ファイルを選んでから再度ボタンを押してください。")
+        from app.drive_latest import pick_latest_uploaded
+
+        latest_upload = pick_latest_uploaded(uploaded_files)
+        content = latest_upload.getvalue()
+        raw = load_csv_from_upload(latest_upload)
+        result = apply_import_policy(
+            raw,
+            file_id=f"upload:{latest_upload.name}",
+            file_name=latest_upload.name,
+            content=content,
+            modified_time=None,
+            mode=import_mode,
+            start_date=start_date,
+            end_date=end_date,
+            date_column=date_column_override.strip() or None,
+        )
+        st.session_state.df = result["df"]
+        st.session_state.import_meta = {
+            **result,
+            "source_name": latest_upload.name,
+            "candidates": len(uploaded_files),
+        }
+        st.success(
+            f"アップロード完了（最新のみ）: {latest_upload.name} ／ "
+            f"候補{len(uploaded_files)}件中1件 ／ "
+            f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
+        )
+        for note in result.get("notes") or []:
+            st.info(note)
+    except Exception as e:
+        st.error(f"CSVの読み込みエラー: {e}")
+        logger.exception("upload load failed")
+
+elif load_from_drive:
+    try:
+        reset_load_state()
+        with st.spinner("最新CSVを検索・取得中..."):
+            api_key = (api_key_input or "").strip() or get_google_api_key()
+            loaded = load_latest_csv_for_analysis(
+                drive_url=drive_url.strip(),
+                api_key=api_key,
+                prefer_local=prefer_local,
+            )
+            info = loaded["info"]
+            content = loaded["content"]
+            raw = loaded["raw"]
             result = apply_import_policy(
                 raw,
-                file_id=file_id,
-                file_name=file_id,
+                file_id=info.file_id,
+                file_name=info.name,
                 content=content,
-                modified_time=modified,
+                modified_time=info.modified_time,
                 mode=import_mode,
                 start_date=start_date,
                 end_date=end_date,
                 date_column=date_column_override.strip() or None,
             )
         st.session_state.df = result["df"]
-        st.session_state.import_meta = result
-        st.session_state.pdf_bytes = None
-        st.session_state.pdf_error = None
-        st.session_state.last_upload_key = None
+        st.session_state.import_meta = {
+            **result,
+            "source_name": info.name,
+            "source": info.source,
+            "file_id": info.file_id,
+        }
+        st.session_state.latest_csv_info = {
+            "name": info.name,
+            "file_id": info.file_id,
+            "modified_time": info.modified_time,
+            "created_time": info.created_time,
+            "source": info.source,
+        }
         st.success(
-            f"Google Driveから読み込みました: 全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
+            f"最新CSVを取り込みました: **{info.name}** ／ "
+            f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
             f"（モード: {result['mode']}）"
         )
-        if result.get("modified_time"):
-            st.caption(f"Drive Last-Modified: {result['modified_time']}")
+        st.caption(
+            f"source={info.source} / file_id={info.file_id} / "
+            f"modified={info.modified_time or '-'} / created={info.created_time or '-'}"
+        )
         for note in result.get("notes") or []:
             st.info(note)
         if result["selected_rows"] == 0:
@@ -418,16 +507,18 @@ elif load_from_drive and drive_url.strip():
                 "「全件（再分析）」または期間指定を変更してください。"
             )
     except Exception as e:
-        st.error(f"Google Driveの読み込みエラー: {e}")
-        logger.exception("drive load failed")
+        st.error(f"最新CSVの取得エラー: {e}")
+        logger.exception("latest csv load failed")
 
 df = st.session_state.df
 
 if df is not None:
     meta = st.session_state.get("import_meta") or {}
-    if meta:
+    latest_info = st.session_state.get("latest_csv_info") or {}
+    if meta or latest_info:
+        name = latest_info.get("name") or meta.get("source_name") or "-"
         st.caption(
-            f"取り込みモード: {meta.get('mode')} / "
+            f"使用中CSV: {name} / 取り込みモード: {meta.get('mode')} / "
             f"元データ {meta.get('total_rows')} 行 → 表示中 {len(df)} 行"
             + (f" / 日付カラム: {meta.get('date_column_used')}" if meta.get("date_column_used") else "")
         )
@@ -690,8 +781,14 @@ if df is not None:
     render_pdf_section(filtered_df)
 
 else:
-    st.info("👆 CSVファイルをアップロードするか、Google Driveのリンクから読み込んでください。")
+    st.info("👆 「最新CSVを取り込む」ボタンで、毎回最新のCSVだけを取得します。")
     st.markdown("""
+    **取り込みルール：**
+    - Google Drive **フォルダURL** → 中のCSVを更新日時で並べ、最新1件のみ
+    - Google Drive **ファイルURL** → そのファイルを毎回新規ダウンロード
+    - ローカル `data/input` → 更新日時が最新のCSV
+    - ブラウザアップロード（複数） → ファイル名の日付が新しいもの優先
+
     **対応カラム例：**
     | 標準カラム名 | VR CSVカラム名 | 内容 |
     |---|---|---|
