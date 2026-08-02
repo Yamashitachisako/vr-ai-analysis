@@ -249,6 +249,23 @@ def format_vr_usage_log(
             f"fileId={s.file.file_id} | modifiedTime={s.file.modified_time or '-'} | "
             f"records={s.record_count} | Player_IDユニーク={pids}"
         )
+    # 結合後の Player_ID 件数も出せる場合
+    try:
+        import pandas as pd
+        from app.vr_dashboard_charts import player_id_summary
+
+        frames = [s.df for s in selections if getattr(s, "df", None) is not None]
+        if frames:
+            merged = pd.concat(frames, ignore_index=True)
+            summary = player_id_summary(merged)
+            lines.append("  --- Player_ID件数サマリー ---")
+            for _, row in summary.iterrows():
+                extra = ""
+                if "数値データ" in summary.columns:
+                    extra = f" / 数値={row['数値データ']}"
+                lines.append(f"  - {row['Player_ID']}: {row['件数']}件{extra}")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 

@@ -99,26 +99,85 @@ def _from_env_or_file() -> dict[str, Any] | None:
 
 
 def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
-    """Streamlit TOML / Cloud Secrets 由来の private_key を PEM として使える形に直す。"""
+    """Streamlit TOML / Cloud Secrets 由来の private_key を PEM として使える形に直す。
+
+    Cloud で多い失敗:
+      - `\\n` が実改行にならない
+      - base64 本体に不正文字（例: `.` = symbol 46）が混入
+    """
+    import base64
+    import re
+
     out = {str(k): v for k, v in info.items()}
     key = str(out.get("private_key", ""))
     key = key.strip()
-    # 余分な囲み引用符
     if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
         key = key[1:-1].strip()
+
     # エスケープ改行を実改行へ（多重エスケープも解消）
-    for _ in range(3):
+    for _ in range(5):
         if "\\n" in key:
             key = key.replace("\\n", "\n")
         else:
             break
-    key = key.replace("\r\n", "\n").replace("\r", "\n")
-    # 先頭に付く余計な空白行を整理
-    key = key.strip() + "\n"
-    # BEGIN/END が1行に潰れている場合の最低限の修復はしない（誤修復リスク）
-    if "BEGIN PRIVATE KEY" not in key:
-        logger.warning("private_key に BEGIN PRIVATE KEY が見つかりません")
-    out["private_key"] = key
+    key = key.replace("\\r", "").replace("\r\n", "\n").replace("\r", "\n")
+    key = key.strip()
+
+    # BEGIN/END ブロックを抽出（PKCS#8 / RSA 両対応）
+    m = re.search(
+        r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----(.*?)-----END \1-----",
+        key,
+        flags=re.DOTALL,
+    )
+    if not m:
+        # ラベル不一致でも BEGIN/END があれば salvage
+        m2 = re.search(
+            r"-----BEGIN ([^-]+)-----(.*?)-----END ([^-]+)-----",
+            key,
+            flags=re.DOTALL,
+        )
+        if not m2:
+            msg = "private_key から PEM BEGIN/END ブロックを抽出できません"
+            logger.warning(msg)
+            _token_holder["last_error"] = msg
+            out["private_key"] = key + ("\n" if not key.endswith("\n") else "")
+            return out
+        label = m2.group(1).strip()
+        body = m2.group(2)
+    else:
+        label = m.group(1).strip()
+        body = m.group(2)
+
+    # base64 として不正な文字（`.`=46 など）と空白を除去
+    cleaned = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+    removed = len(re.sub(r"\s+", "", body)) - len(cleaned)
+    if removed > 0:
+        logger.warning(
+            "private_key base64 から不正文字を %s 文字除去しました（Invalid symbol 46 等の原因）",
+            removed,
+        )
+
+    # base64 として decode → encode し直して検証
+    try:
+        # padding 補正
+        pad = (-len(cleaned)) % 4
+        if pad:
+            cleaned += "=" * pad
+        raw = base64.b64decode(cleaned, validate=False)
+        cleaned = base64.b64encode(raw).decode("ascii")
+    except Exception as e:
+        msg = f"private_key base64 の検証に失敗: {type(e).__name__}: {e}"
+        logger.warning(msg)
+        _token_holder["last_error"] = msg
+
+    # 64文字折り返しで正規 PEM を再構築
+    lines = [cleaned[i : i + 64] for i in range(0, len(cleaned), 64)]
+    pem = "-----BEGIN " + label + "-----\n"
+    pem += "\n".join(lines)
+    if lines:
+        pem += "\n"
+    pem += "-----END " + label + "-----\n"
+    out["private_key"] = pem
 
     for field in (
         "type",
@@ -139,6 +198,15 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
         out["type"] = "service_account"
     if not out.get("token_uri"):
         out["token_uri"] = "https://oauth2.googleapis.com/token"
+
+    # 診断ログ（秘密本体は出さない）
+    logger.info(
+        "private_key normalized: label=%s pem_len=%s has_newline=%s client_email=%s",
+        label,
+        len(pem),
+        "\n" in pem,
+        out.get("client_email"),
+    )
     return out
 
 

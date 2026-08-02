@@ -23,10 +23,67 @@ EVENT_COLORS = {
 
 
 def value_column(df: pd.DataFrame) -> str | None:
-    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic"):
+    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value"):
         if col in df.columns:
             return col
     return None
+
+
+def player_id_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Player_ID ごとの件数と数値列の有効件数。"""
+    if "Player_ID" not in df.columns or df.empty:
+        return pd.DataFrame(columns=["Player_ID", "件数"])
+
+    tmp = df.copy()
+    tmp["Player_ID"] = tmp["Player_ID"].astype(str)
+    summary = (
+        tmp.groupby("Player_ID", dropna=False)
+        .size()
+        .reset_index(name="件数")
+        .sort_values("Player_ID", key=lambda s: s.str.lower())
+    )
+
+    value_col = value_column(df)
+    if value_col and value_col in tmp.columns:
+        nums = pd.to_numeric(tmp[value_col], errors="coerce")
+        tmp["_num"] = nums
+        valid = (
+            tmp.dropna(subset=["_num"])
+            .groupby("Player_ID")
+            .size()
+            .rename(f"{value_col}有効件数")
+        )
+        summary = summary.merge(valid, on="Player_ID", how="left")
+        summary[f"{value_col}有効件数"] = (
+            summary[f"{value_col}有効件数"].fillna(0).astype(int)
+        )
+        summary["数値データ"] = summary[f"{value_col}有効件数"].apply(
+            lambda n: "あり" if n > 0 else "データなし"
+        )
+    else:
+        summary["数値データ"] = "列なし"
+    return summary.reset_index(drop=True)
+
+
+def player_value_chart_frame(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """全 Player_ID を残し、数値欠損は NaN のまま（グラフでデータなし表示用）。"""
+    players = sorted(
+        df["Player_ID"].dropna().astype(str).unique().tolist(),
+        key=lambda x: x.lower(),
+    )
+    tmp = df.copy()
+    tmp["Player_ID"] = tmp["Player_ID"].astype(str)
+    tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
+    avg = tmp.groupby("Player_ID")[value_col].mean()
+    out = pd.DataFrame({"Player_ID": players})
+    out[value_col] = out["Player_ID"].map(avg)
+    out["表示用"] = out[value_col].apply(
+        lambda v: float(v) if pd.notna(v) else 0.0
+    )
+    out["状態"] = out[value_col].apply(
+        lambda v: "数値あり" if pd.notna(v) else "データなし"
+    )
+    return out
 
 
 def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,6 +123,25 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     if selected_target != "全て" and "Target_Object" in filtered.columns:
         filtered = filtered[filtered["Target_Object"].astype(str) == selected_target]
 
+    # --- Player_ID 件数サマリーを先に表示 ---
+    st.markdown('<div class="section-header">👥 Player_ID 件数サマリー</div>', unsafe_allow_html=True)
+    summary = player_id_summary(filtered)
+    if not summary.empty:
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        logger.info("Player_ID summary: %s", summary.to_dict(orient="records"))
+        st.caption(
+            "先頭行が特定の Player_ID（例: ota）でも、上表で全員分の件数を確認できます。"
+        )
+        if value_col and f"{value_col}有効件数" in summary.columns:
+            no_num = summary[summary[f"{value_col}有効件数"] == 0]["Player_ID"].tolist()
+            if no_num:
+                st.info(
+                    f"{value_col} が空/None/非数値のためグラフ平均に乗らない Player_ID: "
+                    + ", ".join(no_num)
+                )
+    else:
+        st.caption("Player_ID 列がありません。")
+
     st.markdown('<div class="section-header">📋 データプレビュー</div>', unsafe_allow_html=True)
     st.caption(f"列名（CSVヘッダー）: {list(filtered.columns)}")
     st.dataframe(filtered, use_container_width=True, height=250)
@@ -82,15 +158,19 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
 
     c1.metric("総レコード数", f"{total_rows} 件")
     c2.metric("Event_Type件数", f"{len(event_rows)} 件")
+    c_players = (
+        filtered["Player_ID"].dropna().astype(str).nunique()
+        if "Player_ID" in filtered.columns
+        else 0
+    )
+    c3.metric("Player_ID種類", f"{c_players} 名")
 
     if value_col and value_col in filtered.columns:
         vals = pd.to_numeric(filtered[value_col], errors="coerce").dropna()
         label = value_col
-        c3.metric(f"{label}平均", f"{vals.mean():.2f}" if not vals.empty else "N/A")
-        c4.metric(f"{label}最大", f"{vals.max():.2f}" if not vals.empty else "N/A")
-        c5.metric(f"{label}最小", f"{vals.min():.2f}" if not vals.empty else "N/A")
+        c4.metric(f"{label}平均", f"{vals.mean():.2f}" if not vals.empty else "N/A")
+        c5.metric(f"{label}有効件数", f"{len(vals)} 件")
     else:
-        c3.metric("数値列", "N/A")
         c4.metric("数値列", "N/A")
         c5.metric("数値列", "N/A")
 
@@ -101,7 +181,7 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
         )
         a, b = st.columns(2)
         with a:
-            if value_col and "Elapsed_Time" in filtered.columns:
+            if value_col and value_col in filtered.columns:
                 plot_df = filtered.copy()
                 plot_df[value_col] = pd.to_numeric(plot_df[value_col], errors="coerce")
                 plot_df = plot_df.dropna(subset=[value_col])
@@ -117,6 +197,8 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
                     )
                     fig.update_layout(height=350)
                     st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.caption(f"{value_col} に有効数値がなく、折れ線はデータなしです。")
         with b:
             if value_col and "Event_Type" in filtered.columns:
                 tmp = filtered.copy()
@@ -140,6 +222,8 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
                     )
                     fig.update_layout(height=350, showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.caption("Event_Type別平均: データなし")
     except Exception as e:
         st.warning(f"グラフエラー: {e}")
         logger.exception("chart error")
@@ -148,29 +232,58 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
         c, d = st.columns(2)
         with c:
             st.markdown(
-                f'<div class="section-header">👤 Player_ID別 {value_col or ""}</div>',
+                f'<div class="section-header">👤 Player_ID別 {value_col or "件数"}</div>',
                 unsafe_allow_html=True,
             )
-            if value_col and "Player_ID" in filtered.columns:
-                tmp = filtered.copy()
-                tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
-                avg = (
-                    tmp.dropna(subset=[value_col])
-                    .groupby("Player_ID")[value_col]
-                    .mean()
-                    .reset_index()
-                )
-                if not avg.empty:
+            if "Player_ID" in filtered.columns:
+                if value_col and value_col in filtered.columns:
+                    chart_df = player_value_chart_frame(filtered, value_col)
                     fig = px.bar(
-                        avg,
+                        chart_df,
                         x="Player_ID",
-                        y=value_col,
+                        y="表示用",
+                        color="状態",
+                        title=f"Player_ID別 {value_col}平均（全員表示）",
+                        labels={
+                            "Player_ID": "Player_ID",
+                            "表示用": value_col,
+                            "状態": "状態",
+                        },
+                        color_discrete_map={
+                            "数値あり": "#4a90d9",
+                            "データなし": "#bdc3c7",
+                        },
+                        hover_data={"状態": True, value_col: True, "表示用": False},
+                    )
+                    fig.update_layout(height=350)
+                    st.plotly_chart(fig, use_container_width=True)
+                    missing = chart_df[chart_df["状態"] == "データなし"]["Player_ID"].tolist()
+                    if missing:
+                        st.caption(
+                            "データなし（灰）: "
+                            + ", ".join(missing)
+                            + f" ／ {value_col} が空・None・非数値です"
+                        )
+                else:
+                    # 数値列が無い場合は件数で全員表示
+                    counts = (
+                        filtered.assign(Player_ID=filtered["Player_ID"].astype(str))
+                        .groupby("Player_ID")
+                        .size()
+                        .reset_index(name="件数")
+                        .sort_values("Player_ID", key=lambda s: s.str.lower())
+                    )
+                    fig = px.bar(
+                        counts,
+                        x="Player_ID",
+                        y="件数",
                         color="Player_ID",
-                        title=f"Player_ID別 {value_col}平均",
-                        labels={"Player_ID": "Player_ID", value_col: value_col},
+                        title="Player_ID別 件数（全員表示）",
                     )
                     fig.update_layout(height=350, showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption("Player_ID 列がありません。")
         with d:
             st.markdown(
                 '<div class="section-header">📍 Target_Object × Event_Type</div>',
@@ -197,8 +310,11 @@ def render_vr_dashboard(df: pd.DataFrame) -> pd.DataFrame:
                     )
                     fig.update_layout(height=350)
                     st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.caption("Target_Object × Event_Type: データなし")
     except Exception as e:
         st.warning(f"Player_ID / Target_Object グラフエラー: {e}")
+        logger.exception("player chart error")
 
     try:
         st.markdown(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import sys
 from pathlib import Path
 
@@ -12,15 +13,31 @@ sys.path.insert(0, str(ROOT))
 from app.drive_auth import _normalize_private_key
 from app.drive_latest import CsvFileInfo
 from app.vr_csv_loader import device_key_from_filename, infer_device_id
+from app.vr_dashboard_charts import player_id_summary, player_value_chart_frame
 import pandas as pd
 
 
+def _pem_with_body(body: str, *, escaped: bool = True) -> str:
+    if escaped:
+        return (
+            "-----BEGIN PRIVATE KEY-----\\n"
+            + body
+            + "\\n-----END PRIVATE KEY-----\\n"
+        )
+    return (
+        "-----BEGIN PRIVATE KEY-----\n"
+        + body
+        + "\n-----END PRIVATE KEY-----\n"
+    )
+
+
 def test_normalize_escaped_newlines():
+    body = base64.b64encode(b"\x01" * 48).decode("ascii")
     info = _normalize_private_key(
         {
             "type": "service_account",
             "client_email": "vr-ai-analysis-drive-reader@routinesupport.iam.gserviceaccount.com",
-            "private_key": "-----BEGIN PRIVATE KEY-----\\nABC\\nDEF\\n-----END PRIVATE KEY-----\\n",
+            "private_key": _pem_with_body(body, escaped=True),
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     )
@@ -32,11 +49,36 @@ def test_normalize_escaped_newlines():
     print("OK normalize escaped newlines")
 
 
-def test_normalize_quoted_key():
+def test_normalize_strips_invalid_dot_symbol_46():
+    """Invalid symbol 46 (= '.') を base64 本体から除去できること。"""
+    raw = b"\x02" * 64
+    body = base64.b64encode(raw).decode("ascii")
+    # 途中に不正な '.' を混入
+    tainted = body[:20] + "." + body[20:]
     info = _normalize_private_key(
         {
             "client_email": "a@b.com",
-            "private_key": '"-----BEGIN PRIVATE KEY-----\\nABC\\n-----END PRIVATE KEY-----\\n"',
+            "private_key": _pem_with_body(tainted, escaped=True),
+        }
+    )
+    key = info["private_key"]
+    assert "-----BEGIN PRIVATE KEY-----" in key
+    # PEM ヘッダ以外に単独の不正 '.' が残っていないこと（末尾等は無視）
+    body_only = key.split("-----BEGIN PRIVATE KEY-----", 1)[1]
+    body_only = body_only.split("-----END PRIVATE KEY-----", 1)[0]
+    assert "." not in body_only.replace("\n", "")
+    # 復元後に元バイトへ戻せる
+    cleaned = "".join(body_only.split())
+    assert base64.b64decode(cleaned) == raw
+    print("OK strip invalid dot (symbol 46)")
+
+
+def test_normalize_quoted_key():
+    body = base64.b64encode(b"abc123").decode("ascii")
+    info = _normalize_private_key(
+        {
+            "client_email": "a@b.com",
+            "private_key": '"' + _pem_with_body(body, escaped=True) + '"',
         }
     )
     assert info["private_key"].startswith("-----BEGIN")
@@ -56,14 +98,31 @@ def test_infer_keeps_player_id():
     df = pd.DataFrame({"Player_ID": ["ota", "ota"]})
     assert infer_device_id(info, df) == "ota"
     df2 = pd.DataFrame({"Player_ID": ["Player", "Playerchi"]})
-    # 複数ある場合はファイル名キー
     assert infer_device_id(info, df2) == "Quest 3S"
     print("OK infer keeps player id / filename fallback")
 
 
+def test_player_summary_and_chart_includes_all():
+    df = pd.DataFrame(
+        {
+            "Player_ID": ["ota", "ota", "Player", "Playerchi", "Playeruu"],
+            "Reaction_Time_Micro": [1.0, 2.0, None, 0.0, None],
+        }
+    )
+    summary = player_id_summary(df)
+    assert set(summary["Player_ID"]) == {"ota", "Player", "Playerchi", "Playeruu"}
+    chart = player_value_chart_frame(df, "Reaction_Time_Micro")
+    assert set(chart["Player_ID"]) == {"ota", "Player", "Playerchi", "Playeruu"}
+    assert "データなし" in set(chart["状態"])
+    assert "数値あり" in set(chart["状態"])
+    print("OK player summary/chart includes all players")
+
+
 if __name__ == "__main__":
     test_normalize_escaped_newlines()
+    test_normalize_strips_invalid_dot_symbol_46()
     test_normalize_quoted_key()
     test_device_key_from_filename()
     test_infer_keeps_player_id()
+    test_player_summary_and_chart_includes_all()
     print("ALL TESTS PASSED")
