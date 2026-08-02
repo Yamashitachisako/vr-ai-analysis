@@ -94,6 +94,43 @@ def is_folder_url(url: str) -> bool:
     )
 
 
+def format_csv_selection_log(
+    selected: CsvFileInfo,
+    candidates: list[CsvFileInfo] | None = None,
+) -> str:
+    """画面・ログ共通の選定結果メッセージ。"""
+    lines = [
+        "[最新CSV選定結果]",
+        f"  選択ファイル名: {selected.name}",
+        f"  更新日時(modifiedTime): {selected.modified_time or '(不明)'}",
+        f"  作成日時(createdTime): {selected.created_time or '(不明)'}",
+        f"  file_id: {selected.file_id}",
+        f"  source: {selected.source}",
+    ]
+    if candidates is not None:
+        lines.append(f"  候補件数: {len(candidates)}")
+        ranked = sorted(candidates, key=lambda f: (f.sort_key, f.name), reverse=True)
+        for i, f in enumerate(ranked[:10], start=1):
+            mark = " <-- 選択" if f.file_id == selected.file_id and f.name == selected.name else ""
+            lines.append(
+                f"  [{i}] {f.name} | modified={f.modified_time or '-'} | created={f.created_time or '-'}{mark}"
+            )
+        if len(ranked) > 10:
+            lines.append(f"  ... 他 {len(ranked) - 10} 件")
+    return "\n".join(lines)
+
+
+def log_latest_csv_selection(
+    selected: CsvFileInfo,
+    candidates: list[CsvFileInfo] | None = None,
+) -> str:
+    """選定結果をINFOログに出し、同じ文言を返す。"""
+    message = format_csv_selection_log(selected, candidates)
+    for line in message.splitlines():
+        logger.info(line)
+    return message
+
+
 def pick_latest_csv(files: list[CsvFileInfo]) -> CsvFileInfo:
     """日時（modifiedTime優先）で降順ソートし、最新1件を返す。"""
     if not files:
@@ -103,14 +140,7 @@ def pick_latest_csv(files: list[CsvFileInfo]) -> CsvFileInfo:
         )
     ranked = sorted(files, key=lambda f: (f.sort_key, f.name), reverse=True)
     latest = ranked[0]
-    logger.info(
-        "picked latest csv: name=%s id=%s modified=%s created=%s (from %s candidates)",
-        latest.name,
-        latest.file_id,
-        latest.modified_time,
-        latest.created_time,
-        len(files),
-    )
+    log_latest_csv_selection(latest, files)
     return latest
 
 
@@ -296,33 +326,34 @@ def resolve_latest_csv_from_source(
     api_key: str | None = None,
     local_dir: Path | str | None = LOCAL_CSV_DIR,
     prefer_local: bool = False,
-) -> tuple[CsvFileInfo, bytes]:
+) -> tuple[CsvFileInfo, bytes, list[CsvFileInfo]]:
     """
     ボタン押下ごとに一覧を再取得し、最新CSVだけを返す。
-    戻り値: (file_info, content_bytes)
+    戻り値: (file_info, content_bytes, candidates)
     """
     url = (drive_url or "").strip()
+    candidates: list[CsvFileInfo] = []
 
     if prefer_local and local_dir:
-        local_files = list_local_csvs(local_dir)
-        if local_files:
-            latest = pick_latest_csv(local_files)
+        candidates = list_local_csvs(local_dir)
+        if candidates:
+            latest = pick_latest_csv(candidates)
             content = Path(latest.path).read_bytes()  # type: ignore[arg-type]
-            return latest, content
+            return latest, content, candidates
 
     if url and is_folder_url(url):
         folder_id = extract_drive_folder_id(url)
         if not folder_id:
             raise ValueError("Google DriveフォルダIDをURLから抽出できませんでした。")
-        files = list_drive_folder_csvs(folder_id, api_key=api_key)
-        latest = pick_latest_csv(files)
+        candidates = list_drive_folder_csvs(folder_id, api_key=api_key)
+        latest = pick_latest_csv(candidates)
         content, header_modified = download_drive_file(latest.file_id)
         if not latest.modified_time and header_modified:
             latest.modified_time = header_modified
-        return latest, content
+            log_latest_csv_selection(latest, candidates)
+        return latest, content, candidates
 
     if url:
-        # 単一ファイルURL → そのファイルを毎回新規取得
         file_id = extract_drive_file_id(url)
         if not file_id:
             raise ValueError("Google DriveファイルIDをURLから抽出できませんでした。")
@@ -333,15 +364,16 @@ def resolve_latest_csv_from_source(
             modified_time=header_modified,
             source="drive",
         )
-        return info, content
+        candidates = [info]
+        log_latest_csv_selection(info, candidates)
+        return info, content, candidates
 
-    # Drive URLなし → ローカル最新
     if local_dir:
-        local_files = list_local_csvs(local_dir)
-        if local_files:
-            latest = pick_latest_csv(local_files)
+        candidates = list_local_csvs(local_dir)
+        if candidates:
+            latest = pick_latest_csv(candidates)
             content = Path(latest.path).read_bytes()  # type: ignore[arg-type]
-            return latest, content
+            return latest, content, candidates
 
     raise FileNotFoundError(
         "最新CSVが見つかりませんでした。"

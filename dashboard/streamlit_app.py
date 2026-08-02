@@ -235,15 +235,23 @@ def load_latest_csv_for_analysis(
     prefer_local: bool = False,
 ) -> dict:
     """毎回一覧を再取得し、最新CSVのみを読み込む。"""
-    from app.drive_latest import resolve_latest_csv_from_source
+    from app.drive_latest import format_csv_selection_log, resolve_latest_csv_from_source
 
-    info, content = resolve_latest_csv_from_source(
+    info, content, candidates = resolve_latest_csv_from_source(
         drive_url=drive_url,
         api_key=api_key,
         prefer_local=prefer_local,
     )
+    selection_log = format_csv_selection_log(info, candidates)
+    logger.info("load_latest_csv_for_analysis selected=%s modified=%s", info.name, info.modified_time)
     raw = standardize_columns(read_csv_robust(content))
-    return {"info": info, "content": content, "raw": raw}
+    return {
+        "info": info,
+        "content": content,
+        "raw": raw,
+        "candidates": candidates,
+        "selection_log": selection_log,
+    }
 
 def load_csv_bytes_from_google_drive(url: str) -> tuple[bytes, str, str | None]:
     """互換用: 単一ファイルURLから取得。"""
@@ -419,11 +427,24 @@ if load_from_upload:
         reset_load_state()
         if not uploaded_files:
             raise FileNotFoundError("CSVが選択されていません。ファイルを選んでから再度ボタンを押してください。")
-        from app.drive_latest import pick_latest_uploaded
+        from app.drive_latest import CsvFileInfo, format_csv_selection_log, pick_latest_uploaded
 
         latest_upload = pick_latest_uploaded(uploaded_files)
         content = latest_upload.getvalue()
         raw = load_csv_from_upload(latest_upload)
+        selected_info = CsvFileInfo(
+            file_id=f"upload:{latest_upload.name}",
+            name=latest_upload.name,
+            modified_time=None,
+            source="upload",
+        )
+        candidate_infos = [
+            CsvFileInfo(file_id=f"upload:{f.name}", name=f.name, source="upload")
+            for f in uploaded_files
+        ]
+        selection_log = format_csv_selection_log(selected_info, candidate_infos)
+        for line in selection_log.splitlines():
+            logger.info(line)
         result = apply_import_policy(
             raw,
             file_id=f"upload:{latest_upload.name}",
@@ -440,12 +461,26 @@ if load_from_upload:
             **result,
             "source_name": latest_upload.name,
             "candidates": len(uploaded_files),
+            "selection_log": selection_log,
+        }
+        st.session_state.latest_csv_info = {
+            "name": latest_upload.name,
+            "file_id": f"upload:{latest_upload.name}",
+            "modified_time": None,
+            "created_time": None,
+            "source": "upload",
         }
         st.success(
             f"アップロード完了（最新のみ）: {latest_upload.name} ／ "
             f"候補{len(uploaded_files)}件中1件 ／ "
             f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
         )
+        st.info(
+            f"選択された最新CSV: **{latest_upload.name}** ／ "
+            f"更新日時: （ブラウザアップロードのためファイル名の日付で判定）"
+        )
+        with st.expander("最新CSV選定ログ", expanded=True):
+            st.code(selection_log)
         for note in result.get("notes") or []:
             st.info(note)
     except Exception as e:
@@ -465,6 +500,7 @@ elif load_from_drive:
             info = loaded["info"]
             content = loaded["content"]
             raw = loaded["raw"]
+            selection_log = loaded.get("selection_log") or ""
             result = apply_import_policy(
                 raw,
                 file_id=info.file_id,
@@ -482,6 +518,7 @@ elif load_from_drive:
             "source_name": info.name,
             "source": info.source,
             "file_id": info.file_id,
+            "selection_log": selection_log,
         }
         st.session_state.latest_csv_info = {
             "name": info.name,
@@ -495,10 +532,13 @@ elif load_from_drive:
             f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
             f"（モード: {result['mode']}）"
         )
-        st.caption(
-            f"source={info.source} / file_id={info.file_id} / "
-            f"modified={info.modified_time or '-'} / created={info.created_time or '-'}"
+        st.info(
+            f"選択された最新CSV: **{info.name}** ／ "
+            f"更新日時(modifiedTime): **{info.modified_time or '(不明)'}** ／ "
+            f"作成日時: {info.created_time or '(不明)'}"
         )
+        with st.expander("最新CSV選定ログ", expanded=True):
+            st.code(selection_log or f"選択: {info.name} / modified={info.modified_time}")
         for note in result.get("notes") or []:
             st.info(note)
         if result["selected_rows"] == 0:
@@ -517,11 +557,15 @@ if df is not None:
     latest_info = st.session_state.get("latest_csv_info") or {}
     if meta or latest_info:
         name = latest_info.get("name") or meta.get("source_name") or "-"
+        modified = latest_info.get("modified_time") or "(不明)"
         st.caption(
-            f"使用中CSV: {name} / 取り込みモード: {meta.get('mode')} / "
+            f"使用中CSV: {name} / 更新日時: {modified} / 取り込みモード: {meta.get('mode')} / "
             f"元データ {meta.get('total_rows')} 行 → 表示中 {len(df)} 行"
             + (f" / 日付カラム: {meta.get('date_column_used')}" if meta.get("date_column_used") else "")
         )
+        if meta.get("selection_log"):
+            with st.expander("最新CSV選定ログ（確認用）", expanded=False):
+                st.code(meta["selection_log"])
 
     # サイドバー：取り込み履歴
     with st.sidebar:
