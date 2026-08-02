@@ -23,7 +23,7 @@ EVENT_COLORS = {
 
 
 def value_column(df: pd.DataFrame) -> str | None:
-    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value"):
+    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic"):
         if col in df.columns:
             return col
     return None

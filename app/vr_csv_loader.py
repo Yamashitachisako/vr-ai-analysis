@@ -1,13 +1,16 @@
-"""Google Drive 親フォルダから最新CSVを取得する。
+"""VR端末（最大4台）ごとの最新CSV取得・統合。
 
 - sample_session.csv / 仮データは使わない
 - 列名はリネームしない（実CSVヘッダー1行目を正とする）
-- Player_ID の値（ota / Player / player 等）も置き換えない
+- Player_ID の値も置き換えない（端末IDとしてそのまま使う）
+- 全員: 各端末の最新CSVを1つずつ統合（最大4件）
+- 個人: 選択した1端末の最新CSVのみ
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -24,10 +27,12 @@ from app.drive_latest import (
     list_drive_folder_csvs,
     list_local_csvs,
     log_latest_csv_selection,
-    pick_latest_csv,
 )
 
 logger = logging.getLogger(__name__)
+
+# VRは4台＝個人も最大4人分
+EXPECTED_VR_DEVICE_COUNT = 4
 
 # 実CSVで確認したヘッダー（参考。実際はファイル1行目を正とする）
 VR_CSV_HEADERS = [
@@ -47,7 +52,6 @@ VR_CSV_HEADERS = [
     "Local_Z",
 ]
 
-# サンプルCSVの列名（これを検出したら拒否）
 FORBIDDEN_SAMPLE_COLUMNS = {
     "timestamp",
     "player_id",
@@ -59,31 +63,23 @@ FORBIDDEN_SAMPLE_COLUMNS = {
 }
 
 NUMERIC_COLUMNS = (
-    "Elapsed_Time",
     "Player_X",
     "Player_Y",
     "Player_Z",
     "Reaction_Time_Micro",
     "Reaction_Time_Mic",
-    "Data_Value",
     "World_X",
     "World_Y",
     "World_Z",
     "Local_X",
     "Local_Y",
     "Local_Z",
-    "WorldX",
-    "WorldY",
-    "WorldZ",
-    "LocalX",
-    "LocalY",
-    "LocalZ",
 )
 
 
 @dataclass
 class DeviceCsvSelection:
-    """互換用。device_id には CSV の Player_ID 値をそのまま入れる。"""
+    """1台分の最新CSV。device_id は CSV の Player_ID（またはファイル名推定）。"""
 
     device_id: str
     file: CsvFileInfo
@@ -101,7 +97,7 @@ class VrLoadResult:
     selection_log: str = ""
     record_count: int = 0
     headers: list[str] = field(default_factory=list)
-    player_ids: list[str] = field(default_factory=list)
+    player_ids: list[str] = field(default_factory=list)  # 検出した端末ID（最大4）
 
 
 def prepare_vr_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -111,8 +107,11 @@ def prepare_vr_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     lower_map = {c.lower(): c for c in out.columns}
     sample_hits = [name for name in FORBIDDEN_SAMPLE_COLUMNS if name in lower_map]
-    has_real = "Elapsed_Time" in out.columns or "Player_ID" in out.columns or "Event_Type" in out.columns
-    # サンプル形式（timestamp / player_id 等）は拒否。実ヘッダーが無い場合も拒否。
+    has_real = (
+        "Elapsed_Time" in out.columns
+        or "Player_ID" in out.columns
+        or "Event_Type" in out.columns
+    )
     if sample_hits and not has_real:
         raise ValueError(
             "サンプルCSV形式（timestamp / player_id 等）を検出しました。"
@@ -127,13 +126,9 @@ def prepare_vr_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in NUMERIC_COLUMNS:
         if col in out.columns:
-            # Elapsed_Time が "00:00.00" 形式の場合は数値化に失敗してもよい
-            if col == "Elapsed_Time":
-                continue
             out[col] = pd.to_numeric(out[col], errors="coerce")
 
     if "Player_ID" in out.columns:
-        # 値は大文字化・A/B置換せず、前後空白のみ除去
         out["Player_ID"] = out["Player_ID"].astype(str).str.strip()
         out.loc[out["Player_ID"].str.lower().isin(["nan", "none", ""]), "Player_ID"] = pd.NA
 
@@ -182,6 +177,10 @@ def infer_device_id(file_info: CsvFileInfo, df: pd.DataFrame) -> str:
         if not mode.empty:
             return str(mode.iloc[0]).strip()
     return "UNKNOWN"
+
+
+
+
 
 
 def resolve_drive_folder_id(drive_url: str | None) -> str:
@@ -256,28 +255,131 @@ def _load_file_content(info: CsvFileInfo) -> tuple[bytes, str | None]:
     return content, info.modified_time
 
 
+def select_latest_csv_per_device(
+    candidates: list[CsvFileInfo],
+    *,
+    max_downloads: int = 40,
+    max_devices: int = EXPECTED_VR_DEVICE_COUNT,
+) -> tuple[dict[str, DeviceCsvSelection], str]:
+    """候補を modifiedTime 新しい順に読み、端末ごとに最新1件を選ぶ（最大4台）。"""
+    if not candidates:
+        raise FileNotFoundError("CSVファイルが見つかりませんでした。")
+
+    ranked = sorted(candidates, key=lambda f: (f.sort_key, f.name), reverse=True)
+    log_lines = [
+        "[VR端末別 最新CSV選定]",
+        f"  想定端末数={max_devices} / 候補総数={len(ranked)} / "
+        f"読み込み上限={max_downloads}（modifiedTime新しい順）",
+    ]
+
+    selections: dict[str, DeviceCsvSelection] = {}
+    inspected = 0
+    for info in ranked:
+        if len(selections) >= max_devices:
+            break
+        if inspected >= max_downloads and selections:
+            break
+        inspected += 1
+        try:
+            content, _ = _load_file_content(info)
+            df = read_csv_bytes(content)
+        except Exception as e:
+            log_lines.append(f"  skip name={info.name} fileId={info.file_id} error={e}")
+            logger.warning("skip csv name=%s error=%s", info.name, e)
+            continue
+
+        device_id = infer_device_id(info, df)
+        log_lines.append(
+            f"  検査: name={info.name} fileId={info.file_id} "
+            f"modifiedTime={info.modified_time or '-'} device={device_id} rows={len(df)}"
+        )
+        if device_id in selections:
+            # すでに新しい順で選済みのため、後続は古い
+            continue
+
+        selections[device_id] = DeviceCsvSelection(
+            device_id=device_id,
+            file=info,
+            df=df,
+            record_count=len(df),
+        )
+        log_latest_csv_selection(info, [info])
+        log_lines.append(
+            f"  --> 端末 {device_id} の最新: {info.name} | "
+            f"fileId={info.file_id} | modifiedTime={info.modified_time or '-'} | "
+            f"records={len(df)}"
+        )
+
+    if not selections:
+        raise FileNotFoundError("端末ごとの最新CSVを特定できませんでした。")
+
+    if len(selections) > max_devices:
+        # 念のため truncate（通常はループで止まる）
+        keep = sorted(selections.items(), key=lambda x: x[1].file.sort_key, reverse=True)[
+            :max_devices
+        ]
+        selections = dict(keep)
+
+    log_lines.append(
+        f"  確定端末数={len(selections)} / 端末一覧={sorted(selections.keys(), key=str.lower)}"
+    )
+    selection_log = "\n".join(log_lines)
+    for line in log_lines:
+        logger.info(line)
+    return selections, selection_log
+
+
+def build_analysis_frame(
+    selections: dict[str, DeviceCsvSelection],
+    *,
+    mode: str,
+    selected_device: str | None,
+) -> pd.DataFrame:
+    if mode == "individual":
+        if not selected_device:
+            raise ValueError(
+                "個人モードでは VR端末（最大4台のうち1つ）を選択してください。"
+            )
+        if selected_device not in selections:
+            available = ", ".join(sorted(selections.keys(), key=str.lower)) or "(なし)"
+            raise ValueError(
+                f"選択された端末「{selected_device}」の最新CSVが見つかりません。"
+                f"利用可能（最大{EXPECTED_VR_DEVICE_COUNT}台）: {available}"
+            )
+        return selections[selected_device].df.copy()
+
+    frames = [sel.df.copy() for _, sel in sorted(selections.items(), key=lambda x: str(x[0]).lower())]
+    if not frames:
+        raise FileNotFoundError("統合対象のCSVがありません。")
+    return pd.concat(frames, ignore_index=True)
+
+
 def format_usage_log(
     *,
     mode: str,
-    selected_player: str | None,
-    info: CsvFileInfo,
-    df: pd.DataFrame,
+    selected_device: str | None,
+    selections: list[DeviceCsvSelection],
     headers: list[str],
     player_ids: list[str],
+    record_count: int,
 ) -> str:
-    mode_label = "全員" if mode == "all" else "個人"
+    mode_label = "全員（最大4台の最新CSVを統合）" if mode == "all" else "個人（1台の最新CSV）"
     lines = [
         "[使用CSVログ]",
         f"  選択モード: {mode_label}",
-        f"  選択 Player_ID: {selected_player or '(全員)'}",
-        f"  読み込んだCSVファイル名: {info.name}",
-        f"  fileId: {info.file_id}",
-        f"  modifiedTime: {info.modified_time or '-'}",
+        f"  選択端末/Player_ID: {selected_device or '(全員・最大4台)'}",
+        f"  使用ファイル数: {len(selections)} / 想定最大 {EXPECTED_VR_DEVICE_COUNT}",
+        f"  検出端末一覧: {player_ids}",
         f"  CSVヘッダー一覧: {headers}",
-        f"  Player_ID のユニーク値一覧: {player_ids}",
-        f"  表示に使ったレコード件数: {len(df)}",
+        f"  表示に使ったレコード件数: {record_count}",
         f"  folderId: {DEFAULT_DRIVE_FOLDER_ID}",
     ]
+    for s in selections:
+        lines.append(
+            f"  - device={s.device_id} name={s.file.name} "
+            f"fileId={s.file.file_id} modifiedTime={s.file.modified_time or '-'} "
+            f"records={s.record_count}"
+        )
     return "\n".join(lines)
 
 
@@ -291,8 +393,8 @@ def load_vr_csvs_for_mode(
     local_dir: Path | str | None = None,
 ) -> VrLoadResult:
     """
-    folderId 内のCSV一覧を再取得し、modifiedTime 最新の1ファイルを読み込む。
-    mode=individual のときは CSV の Player_ID 値で行フィルタする（値は置換しない）。
+    mode=all: 各VR端末の最新CSVを1つずつ統合（最大4台）
+    mode=individual: 選択端末の最新CSVのみ
     """
     from app.drive_latest import LOCAL_CSV_DIR
 
@@ -302,43 +404,28 @@ def load_vr_csvs_for_mode(
         prefer_local=prefer_local,
         local_dir=local_dir or LOCAL_CSV_DIR,
     )
-    latest = pick_latest_csv(candidates)
-    log_latest_csv_selection(latest, candidates)
+    selections_map, selection_log = select_latest_csv_per_device(candidates)
+    device_ids = sorted(selections_map.keys(), key=str.lower)
 
-    content, _ = _load_file_content(latest)
-    raw_df = read_csv_bytes(content)
-    headers = list(raw_df.columns)
-    all_players = unique_player_ids(raw_df)
-
-    df = raw_df
-    if mode == "individual":
-        if not selected_device:
-            raise ValueError("個人モードでは Player_ID（例: ota / Player）を選択してください。")
-        if "Player_ID" not in df.columns:
-            raise ValueError("CSVに Player_ID 列がありません。")
-        # 完全一致（大文字小文字は CSV の値を正とする）。ユーザー入力との緩い一致も許容。
-        mask = df["Player_ID"].astype(str) == selected_device
-        if not mask.any():
-            # 大文字小文字を無視した候補提示
-            raise ValueError(
-                f"Player_ID「{selected_device}」の行がありません。"
-                f"CSV内の値: {all_players}"
-            )
-        df = df.loc[mask].copy()
-
-    selection = DeviceCsvSelection(
-        device_id=selected_device or ",".join(all_players) or "ALL",
-        file=latest,
-        df=df,
-        record_count=len(df),
+    df = build_analysis_frame(
+        selections_map,
+        mode=mode,
+        selected_device=selected_device,
     )
+
+    if mode == "individual" and selected_device:
+        used = [selections_map[selected_device]]
+    else:
+        used = [selections_map[k] for k in device_ids]
+
+    headers = list(df.columns)
     usage = format_usage_log(
         mode=mode,
-        selected_player=selected_device,
-        info=latest,
-        df=df,
+        selected_device=selected_device,
+        selections=used,
         headers=headers,
-        player_ids=all_players,
+        player_ids=device_ids,
+        record_count=len(df),
     )
     logger.info(usage)
 
@@ -346,41 +433,10 @@ def load_vr_csvs_for_mode(
         mode=mode,
         selected_device=selected_device,
         df=df,
-        selections=[selection],
+        selections=used,
         candidates=candidates,
-        selection_log=usage,
+        selection_log=selection_log + "\n\n" + usage,
         record_count=len(df),
         headers=headers,
-        player_ids=all_players,
+        player_ids=device_ids,
     )
-
-
-# 後方互換エイリアス
-def select_latest_csv_per_device(candidates: list[CsvFileInfo], **kwargs):
-    latest = pick_latest_csv(candidates)
-    content, _ = _load_file_content(latest)
-    df = read_csv_bytes(content)
-    pid = infer_device_id(latest, df)
-    sel = DeviceCsvSelection(device_id=pid, file=latest, df=df, record_count=len(df))
-    return {pid: sel}, format_usage_log(
-        mode="all",
-        selected_player=None,
-        info=latest,
-        df=df,
-        headers=list(df.columns),
-        player_ids=unique_player_ids(df),
-    )
-
-
-def build_analysis_frame(
-    selections: dict[str, DeviceCsvSelection],
-    *,
-    mode: str,
-    selected_device: str | None,
-) -> pd.DataFrame:
-    if mode == "individual":
-        if not selected_device or selected_device not in selections:
-            raise ValueError(f"Player_ID「{selected_device}」のCSVがありません。")
-        return selections[selected_device].df.copy()
-    frames = [s.df.copy() for _, s in sorted(selections.items(), key=lambda x: str(x[0]))]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

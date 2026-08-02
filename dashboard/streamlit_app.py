@@ -206,22 +206,24 @@ def format_vr_usage_log(
     headers: list | None = None,
     player_ids: list | None = None,
 ) -> str:
-    mode_label = "全員" if mode == "all" else "個人"
+    mode_label = "全員（最大4台統合）" if mode == "all" else "個人（1台）"
     lines = [
         "[使用CSVログ]",
         f"  選択モード: {mode_label}",
-        f"  選択 Player_ID: {selected_device or '(全員)'}",
+        f"  選択端末/Player_ID: {selected_device or '(全員・最大4台)'}",
+        f"  使用ファイル数: {len(selections)}",
         f"  表示に使ったレコード件数: {chart_record_count if chart_record_count is not None else record_count}",
     ]
     if headers is not None:
         lines.append(f"  CSVヘッダー一覧: {list(headers)}")
     if player_ids is not None:
-        lines.append(f"  Player_ID のユニーク値一覧: {list(player_ids)}")
+        lines.append(f"  検出端末一覧（最大4）: {list(player_ids)[:4]}")
     for s in selections:
-        lines.append(f"  読み込んだCSVファイル名: {s.file.name}")
-        lines.append(f"  fileId: {s.file.file_id}")
-        lines.append(f"  modifiedTime: {s.file.modified_time or '-'}")
-        lines.append(f"  records: {s.record_count}")
+        lines.append(
+            f"  - device={s.device_id} name={s.file.name} "
+            f"fileId={s.file.file_id} modifiedTime={s.file.modified_time or '-'} "
+            f"records={s.record_count}"
+        )
     return "\n".join(lines)
 
 
@@ -409,32 +411,41 @@ with st.sidebar:
         "全員 / 個人",
         options=["全員", "個人"],
         index=0,
-        help="全員: Drive最新CSVの全行。個人: 同じCSV内の選択 Player_ID のみ（値はCSVどおり）。",
+        help=(
+            "全員: VR4台それぞれの最新CSVを統合して分析します。"
+            "個人: 選んだ1台（Player_ID）の最新CSVだけを分析します。"
+        ),
         key="analysis_scope_radio",
     )
     analysis_mode = "all" if scope_label == "全員" else "individual"
     selected_device = None
     if analysis_mode == "individual":
         player_options = sorted(
-            set(st.session_state.available_players + st.session_state.available_devices),
-            key=lambda x: str(x).lower(),
-        )
+            {
+                str(p).strip()
+                for p in (st.session_state.available_players + st.session_state.available_devices)
+                if str(p).strip()
+            },
+            key=lambda x: x.lower(),
+        )[:4]
         if player_options:
             selected_device = st.selectbox(
-                "個人（Player_ID）",
+                "個人を選択（Player_ID / VR端末）",
                 options=player_options,
                 key="selected_device_box",
+                help="検出された最大4台から1人分を選びます。",
             )
         custom_device = st.text_input(
-            "Player_ID を手入力（CSVの値どおり。例: ota / Player）",
+            "手入力（任意）",
             value="",
-            placeholder="ota",
+            placeholder="例: ota",
+            help="一覧に無いときだけ、CSVの Player_ID をそのまま入力します。",
             key="custom_device_input",
         )
         if custom_device.strip():
             selected_device = custom_device.strip()
         if not selected_device:
-            st.caption("※ 先に「全員」で取り込むか、Player_ID を手入力してください。")
+            st.info("個人を選ぶか、Player_ID を手入力してから「最新CSVを取り込む」を押してください。")
 
     selection_sig = (analysis_mode, selected_device)
     prev_sig = st.session_state.get("vr_selection_sig")
@@ -446,10 +457,15 @@ with st.sidebar:
             selection_sig,
             " and force reload" if had_data else "",
         )
+        # 端末一覧は残し、分析データだけ破棄する
+        kept_players = list(st.session_state.available_players)
+        kept_devices = list(st.session_state.available_devices)
         reset_load_state()
+        st.session_state.available_players = kept_players
+        st.session_state.available_devices = kept_devices
         st.session_state.had_successful_load = False
-        # 前回読み込み済みなら、選択変更時に必ず再取得して再描画する
-        if had_data:
+        # 個人で端末未選択のときは自動再取得しない（エラー回避）
+        if had_data and not (analysis_mode == "individual" and not selected_device):
             st.session_state.force_csv_reload = True
     st.session_state.vr_selection_sig = selection_sig
 
@@ -499,11 +515,12 @@ st.markdown('<div class="section-header">📂 データ読み込み</div>', unsa
 st.caption(
     "ボタン押下のたびに Google Drive の CSV 一覧を再取得します。"
     "最新判定はファイル名ではなく **modifiedTime** です。"
+    "全員は最大4台分の最新CSVを統合し、個人は1台分のみ使います。"
     "列名は実CSVヘッダー（Elapsed_Time / Event_Type / Player_ID 等）をそのまま使います。"
 )
 
 uploaded_files = st.file_uploader(
-    "CSVをアップロード（複数可・端末ごとに最新を使用）",
+    "CSVをアップロード（複数可・最大4台それぞれ最新を使用）",
     type=["csv"],
     accept_multiple_files=True,
     key="csv_uploader",
@@ -537,10 +554,8 @@ api_key_input = st.text_input(
     type="password",
     help="フォルダ内のCSV一覧取得に使います。未設定でも公開フォルダの取得を試みます。",
 )
-prefer_local = st.checkbox(
-    "ローカル data/input の実CSVを優先する（通常は Drive を使用）",
-    value=False,
-)
+prefer_local = False  # sample / ローカル仮データは使わず、常に Google Drive から取得
+st.caption("データソース: Google Drive 実CSVのみ（sample_session.csv / 仮データは使用しません）")
 load_from_drive = st.button(
     "最新CSVを取り込む",
     type="primary",
@@ -550,49 +565,61 @@ load_from_drive = st.button(
 st.markdown("---")
 
 do_drive_load = load_from_drive or st.session_state.get("force_csv_reload", False)
+if do_drive_load and analysis_mode == "individual" and not selected_device:
+    st.session_state.force_csv_reload = False
+    do_drive_load = False
+    st.warning("個人モードです。先に個人（Player_ID）を選択してから取り込んでください。")
 
 if load_from_upload:
     try:
         reset_load_state()
         if not uploaded_files:
             raise FileNotFoundError("CSVが選択されていません。ファイルを選んでから再度ボタンを押してください。")
-        from app.drive_latest import CsvFileInfo, pick_latest_uploaded
-        from app.vr_csv_loader import DeviceCsvSelection, prepare_vr_dataframe, unique_player_ids
+        from app.drive_latest import CsvFileInfo
+        from app.vr_csv_loader import (
+            DeviceCsvSelection,
+            EXPECTED_VR_DEVICE_COUNT,
+            infer_device_id,
+            prepare_vr_dataframe,
+        )
 
-        latest_upload = pick_latest_uploaded(uploaded_files)
-        if latest_upload.name.lower() == "sample_session.csv":
-            raise ValueError("sample_session.csv は使用できません。Google Driveの実CSVを使ってください。")
-        raw = prepare_vr_dataframe(read_csv_robust(latest_upload.getvalue()))
-        headers = list(raw.columns)
-        players = unique_player_ids(raw)
+        by_device: dict[str, DeviceCsvSelection] = {}
+        for uploaded in uploaded_files:
+            if uploaded.name.lower() == "sample_session.csv":
+                raise ValueError("sample_session.csv は使用できません。Google Driveの実CSVを使ってください。")
+            raw = prepare_vr_dataframe(read_csv_robust(uploaded.getvalue()))
+            info = CsvFileInfo(
+                file_id=f"upload:{uploaded.name}",
+                name=uploaded.name,
+                modified_time=None,
+                source="upload",
+            )
+            device_id = infer_device_id(info, raw)
+            # 同端末が複数ある場合は後勝ち（アップロード順）。最大4台。
+            if device_id not in by_device and len(by_device) >= EXPECTED_VR_DEVICE_COUNT:
+                continue
+            by_device[device_id] = DeviceCsvSelection(
+                device_id=device_id,
+                file=info,
+                df=raw,
+                record_count=len(raw),
+            )
+
+        players = sorted(by_device.keys(), key=str.lower)
         st.session_state.available_players = players
         st.session_state.available_devices = players
 
-        df_use = raw
         if analysis_mode == "individual":
             if not selected_device:
-                raise ValueError("個人モードでは Player_ID を指定してください。")
-            if "Player_ID" not in df_use.columns:
-                raise ValueError("CSVに Player_ID 列がありません。")
-            mask = df_use["Player_ID"].astype(str) == selected_device
-            if not mask.any():
-                raise ValueError(f"Player_ID「{selected_device}」がありません。値: {players}")
-            df_use = df_use.loc[mask].copy()
+                raise ValueError("個人モードでは VR端末（最大4台のうち1つ）を指定してください。")
+            if selected_device not in by_device:
+                raise ValueError(
+                    f"端末「{selected_device}」がありません。検出: {players}"
+                )
+            used = [by_device[selected_device]]
+        else:
+            used = [by_device[k] for k in players]
 
-        info = CsvFileInfo(
-            file_id=f"upload:{latest_upload.name}",
-            name=latest_upload.name,
-            modified_time=None,
-            source="upload",
-        )
-        used = [
-            DeviceCsvSelection(
-                device_id=selected_device or ",".join(players) or "ALL",
-                file=info,
-                df=df_use,
-                record_count=len(df_use),
-            )
-        ]
         result = apply_import_policy_for_selections(
             used,
             import_mode=import_mode,
@@ -601,7 +628,7 @@ if load_from_upload:
             date_column=date_column_override.strip() or None,
         )
         headers = list(result["df"].columns)
-        player_ids = unique_player_ids(result["df"]) if len(result["df"]) else players
+        player_ids = players
         usage_log = format_vr_usage_log(
             mode=analysis_mode,
             selected_device=selected_device,
@@ -613,9 +640,10 @@ if load_from_upload:
         logger.info(usage_log)
         st.session_state.df = result["df"]
         st.session_state.had_successful_load = True
+        source_names = ", ".join(s.file.name for s in used)
         st.session_state.import_meta = {
             **result,
-            "source_name": latest_upload.name,
+            "source_name": source_names,
             "candidates": len(uploaded_files),
             "selection_log": usage_log,
             "usage_log": usage_log,
@@ -625,23 +653,24 @@ if load_from_upload:
             "player_ids": player_ids,
             "files": [
                 {
-                    "device": used[0].device_id,
-                    "name": info.name,
-                    "file_id": info.file_id,
+                    "device": s.device_id,
+                    "name": s.file.name,
+                    "file_id": s.file.file_id,
                     "modified_time": None,
-                    "records": len(result["df"]),
+                    "records": s.record_count,
                 }
+                for s in used
             ],
         }
         st.session_state.latest_csv_info = {
-            "name": latest_upload.name,
-            "file_id": info.file_id,
+            "name": source_names,
+            "file_id": ",".join(s.file.file_id for s in used),
             "modified_time": None,
             "source": "upload",
         }
         st.success(
             f"アップロード完了（モード: {scope_label}）／ "
-            f"{latest_upload.name} ／ "
+            f"端末 {len(used)} 台分／ "
             f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
         )
         with st.expander("使用CSVログ", expanded=True):
@@ -656,7 +685,7 @@ elif do_drive_load:
     try:
         st.session_state.force_csv_reload = False
         reset_load_state()
-        with st.spinner("CSV一覧を再取得し、端末ごとの最新ファイルを選定中..."):
+        with st.spinner("CSV一覧を再取得し、VR最大4台それぞれの最新ファイルを選定中..."):
             api_key = (api_key_input or "").strip() or get_google_api_key()
             loaded = load_vr_csv_bundle(
                 drive_url=drive_url.strip(),
@@ -668,12 +697,9 @@ elif do_drive_load:
             vr_result = loaded["result"]
             selection_log = loaded.get("selection_log") or ""
             usage_log = loaded.get("usage_log") or vr_result.selection_log or ""
-            players = list(vr_result.player_ids or [])
-            st.session_state.available_players = sorted(
-                set(players) | set(st.session_state.available_players),
-                key=lambda x: str(x).lower(),
-            )
-            st.session_state.available_devices = list(st.session_state.available_players)
+            players = list(vr_result.player_ids or [])[:4]
+            st.session_state.available_players = players
+            st.session_state.available_devices = players
             result = apply_import_policy_for_selections(
                 vr_result.selections,
                 import_mode=import_mode,
@@ -681,18 +707,16 @@ elif do_drive_load:
                 end_date=end_date,
                 date_column=date_column_override.strip() or None,
             )
-            # import 後もヘッダーを維持
+            # import 後もヘッダーを維持。端末一覧は最大4台の選定結果を正とする。
             headers = list(result["df"].columns) if result["df"] is not None else list(vr_result.headers)
-            from app.vr_csv_loader import unique_player_ids
-
-            player_ids = unique_player_ids(result["df"]) if len(result["df"]) else players
+            player_ids = players
             usage_log = format_vr_usage_log(
                 mode=analysis_mode,
                 selected_device=selected_device,
                 selections=vr_result.selections,
                 record_count=result["selected_rows"],
                 headers=headers,
-                player_ids=player_ids or players,
+                player_ids=player_ids,
             )
             logger.info(usage_log)
             for line in (selection_log or "").splitlines():
@@ -707,7 +731,7 @@ elif do_drive_load:
             "analysis_mode": analysis_mode,
             "selected_device": selected_device,
             "headers": headers,
-            "player_ids": player_ids or players,
+            "player_ids": player_ids,
             "files": [
                 {
                     "device": s.device_id,
@@ -728,7 +752,7 @@ elif do_drive_load:
         }
         st.success(
             f"取り込み完了（モード: {scope_label}"
-            + (f" / 端末: {selected_device}" if selected_device else "")
+            + (f" / 端末: {selected_device}" if selected_device else " / 最大4台統合")
             + f"）／ 使用ファイル {len(vr_result.selections)} 件／ "
             f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
         )
@@ -807,17 +831,12 @@ if df is not None:
 
 else:
     st.info(
-        "👆 「最新CSVを取り込む」で、毎回 Drive 一覧を再取得し、"
-        "modifiedTime が最新の実CSVから分析します。"
-        "全員／個人を切り替えると、古いデータは破棄して再取得します。"
+        "👆 左の「全員 / 個人」を選んでから「最新CSVを取り込む」を押してください。"
+        "全員＝最大4台統合 / 個人＝選んだ1台のみ。切り替え時は再取得します。"
     )
     st.markdown("""
     **取り込みルール：**
-    - **全員** → Driveフォルダ内の modifiedTime 最新CSVを1件読み込み（全行）
-    - **個人** → 同じ最新CSVのうち、選択した `Player_ID`（ota / Player 等）の行のみ
-    - 仮データ・サンプルCSVは使わない
-    - 列名はリネームせず、実CSVヘッダーどおり
-      （`Elapsed_Time`, `Event_Type`, `Player_ID`, `Player_X`, `Player_Y`, `Player_Z`,
-      `Target_Object`, `Reaction_Time_Micro`, `World_X`, `World_Y`, `World_Z`,
-      `Local_X`, `Local_Y`, `Local_Z`）
+    - **全員** → VR4台それぞれの最新CSVを統合
+    - **個人** → 選択した1台（`Player_ID`）の最新CSVのみ
+    - 列名は実CSVヘッダーどおり（`Elapsed_Time`, `Event_Type`, `Player_ID` など）
     """)

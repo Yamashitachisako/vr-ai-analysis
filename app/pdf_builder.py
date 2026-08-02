@@ -15,7 +15,7 @@ FONT = "HeiseiKakuGo-W5"
 
 
 def _value_series(df: pd.DataFrame) -> pd.Series:
-    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value"):
+    for col in ("Reaction_Time_Micro", "Reaction_Time_Mic"):
         if col in df.columns:
             return pd.to_numeric(df[col], errors="coerce").dropna()
     return pd.Series(dtype=float)
@@ -58,7 +58,7 @@ def build_analysis_comment(df: pd.DataFrame) -> str:
         col_name = next(
             (
                 c
-                for c in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value")
+                for c in ("Reaction_Time_Micro", "Reaction_Time_Mic")
                 if c in df.columns
             ),
             "値",
@@ -150,7 +150,7 @@ def build_pdf_bytes(df: pd.DataFrame) -> bytes:
         col_name = next(
             (
                 c
-                for c in ("Reaction_Time_Micro", "Reaction_Time_Mic", "Data_Value")
+                for c in ("Reaction_Time_Micro", "Reaction_Time_Mic")
                 if c in df.columns
             ),
             "値",
