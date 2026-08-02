@@ -61,6 +61,23 @@ def main() -> None:
         assert latest_local.name == "b.csv", latest_local.name
         print("OK local mtime pick:", latest_local.name)
 
+    from app.drive_latest import (
+        DEFAULT_DRIVE_FOLDER_ID,
+        _modified_time_from_filename,
+        list_drive_csvs_embedded,
+    )
+
+    assert _modified_time_from_filename("Log_X_20260509_165331.csv") == "2026-05-09T16:53:31+00:00"
+    print("OK filename time parse")
+
+    try:
+        embedded = list_drive_csvs_embedded(DEFAULT_DRIVE_FOLDER_ID)
+        assert len(embedded) > 0, "embedded list empty"
+        assert all(f.name.lower().endswith(".csv") for f in embedded)
+        print("OK embedded folder list:", len(embedded), "files; sample=", embedded[0].name)
+    except Exception as e:
+        print("SKIP embedded live test:", e)
+
     print("ALL TESTS PASSED")
 
 

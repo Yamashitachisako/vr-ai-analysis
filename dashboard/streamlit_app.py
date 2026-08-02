@@ -512,6 +512,10 @@ st.caption(
     "固定参照フォルダ: `1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9` ／ "
     "単体 fileId の固定読み込みはしません"
 )
+st.caption(
+    "推奨: Streamlit Cloud の Secrets に `GOOGLE_API_KEY` を設定すると、"
+    "Drive の modifiedTime で正確に最新CSVを判定できます。"
+)
 api_key_input = st.text_input(
     "Google API Key（任意・フォルダ一覧用）",
     value="",

@@ -214,10 +214,79 @@ def list_drive_csvs_api(folder_id: str, api_key: str) -> list[CsvFileInfo]:
     return files
 
 
+def _modified_time_from_filename(name: str) -> str | None:
+    """ファイル名に埋め込まれた YYYYMMDD_HHMMSS を ISO8601 に変換（API無し時の補助）。"""
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})", name or "")
+    if not m:
+        return None
+    return (
+        f"{m.group(1)}-{m.group(2)}-{m.group(3)}T"
+        f"{m.group(4)}:{m.group(5)}:{m.group(6)}+00:00"
+    )
+
+
+def list_drive_csvs_embedded(folder_id: str) -> list[CsvFileInfo]:
+    """公開フォルダの embeddedfolderview から CSV の id/name を取得。"""
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ja,en;q=0.9",
+        },
+    )
+    with urlopen(request, timeout=60) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    pairs = re.findall(
+        r'id="entry-([a-zA-Z0-9_-]+)"[\s\S]{0,1200}?flip-entry-title[^>]*>([^<]+\.csv)',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if not pairs:
+        pairs = re.findall(
+            r'href="https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)/[^"]*"[\s\S]{0,500}?>'
+            r"([^<]+\.csv)<",
+            html,
+            flags=re.IGNORECASE,
+        )
+
+    by_id: dict[str, CsvFileInfo] = {}
+    for file_id, name in pairs:
+        name = name.strip()
+        if not name.lower().endswith(".csv"):
+            continue
+        by_id[file_id] = CsvFileInfo(
+            file_id=file_id,
+            name=name,
+            modified_time=_modified_time_from_filename(name),
+            source="drive",
+        )
+
+    files = list(by_id.values())
+    logger.info(
+        "drive embedded listed %s csv files in folder %s",
+        len(files),
+        folder_id,
+    )
+    return files
+
+
 def list_drive_csvs_public_html(folder_id: str) -> list[CsvFileInfo]:
     """公開フォルダのHTMLからファイルIDを抽出（日時は取得できない場合あり）。"""
     url = f"https://drive.google.com/drive/folders/{folder_id}"
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
+    )
     with urlopen(request, timeout=60) as resp:
         html = resp.read().decode("utf-8", errors="ignore")
 
@@ -232,12 +301,22 @@ def list_drive_csvs_public_html(folder_id: str) -> list[CsvFileInfo]:
     for fid in file_ids:
         by_id.setdefault(
             fid,
-            CsvFileInfo(file_id=fid, name=f"{fid}.csv", source="drive"),
+            CsvFileInfo(
+                file_id=fid,
+                name=f"{fid}.csv",
+                modified_time=_modified_time_from_filename(f"{fid}.csv"),
+                source="drive",
+            ),
         )
     for name, fid in named + [(n, i) for i, n in named2] + named3:
         if not str(name).lower().endswith(".csv"):
             continue
-        by_id[fid] = CsvFileInfo(file_id=fid, name=name, source="drive")
+        by_id[fid] = CsvFileInfo(
+            file_id=fid,
+            name=name,
+            modified_time=_modified_time_from_filename(name),
+            source="drive",
+        )
 
     # modifiedTime in page JSON
     for fid, info in list(by_id.items()):
@@ -258,6 +337,8 @@ def list_drive_csvs_public_html(folder_id: str) -> list[CsvFileInfo]:
         )
         if c:
             info.created_time = c.group(1)
+        if not info.modified_time:
+            info.modified_time = _modified_time_from_filename(info.name)
 
     files = list(by_id.values())
     logger.info("drive html listed %s csv-like files in folder %s", len(files), folder_id)
@@ -276,6 +357,24 @@ def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[C
         except Exception as e:
             logger.warning("drive api list failed: %s", e)
             errors.append(f"Drive API: {e}")
+    else:
+        errors.append("GOOGLE_API_KEY 未設定（Drive APIの modifiedTime は使えません）")
+
+    # 公開フォルダ向け: embeddedfolderview が最も安定
+    try:
+        files = list_drive_csvs_embedded(folder_id)
+        if files:
+            with_mtime = sum(1 for f in files if f.modified_time)
+            logger.info(
+                "using embedded folder list: %s files (%s with time hint)",
+                len(files),
+                with_mtime,
+            )
+            return files
+        errors.append("embeddedfolderview: CSVが0件でした。")
+    except Exception as e:
+        logger.warning("drive embedded list failed: %s", e)
+        errors.append(f"embeddedfolderview: {e}")
 
     try:
         files = list_drive_csvs_public_html(folder_id)
@@ -290,7 +389,9 @@ def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[C
     raise FileNotFoundError(
         "フォルダ内のCSV一覧を取得できませんでした。"
         f"（{detail}） "
-        "共有を「リンクを知っている全員が閲覧可」にし、可能なら GOOGLE_API_KEY を設定してください。"
+        "共有を「リンクを知っている全員が閲覧可」にし、"
+        "Streamlit Cloud の Secrets に GOOGLE_API_KEY を設定すると "
+        "Drive の modifiedTime で正確に最新判定できます。"
     )
 
 

@@ -212,41 +212,61 @@ def _load_file_content(info: CsvFileInfo) -> tuple[bytes, str | None]:
 
 def select_latest_csv_per_device(
     candidates: list[CsvFileInfo],
+    *,
+    max_downloads: int = 40,
 ) -> tuple[dict[str, DeviceCsvSelection], str]:
-    """全候補を読み、端末ごとに modifiedTime 最新の1件を選ぶ。"""
+    """候補を modifiedTime 新しい順に読み、端末ごとに最新1件を選ぶ。
+
+    全件ダウンロードはしない（Cloud タイムアウト回避）。
+    """
     if not candidates:
         raise FileNotFoundError("CSVファイルが見つかりませんでした。")
 
-    # 端末ごとに候補を集める
-    by_device_files: dict[str, list[tuple[CsvFileInfo, pd.DataFrame]]] = {}
-    log_lines = ["[VR端末別 最新CSV選定]"]
-
-    for info in candidates:
-        content, _ = _load_file_content(info)
-        df = read_csv_bytes(content)
-        device_id = infer_device_id(info, df)
-        by_device_files.setdefault(device_id, []).append((info, df))
-        log_lines.append(
-            f"  候補: name={info.name} fileId={info.file_id} "
-            f"modifiedTime={info.modified_time or '-'} device={device_id} rows={len(df)}"
-        )
+    ranked = sorted(candidates, key=lambda f: (f.sort_key, f.name), reverse=True)
+    log_lines = [
+        "[VR端末別 最新CSV選定]",
+        f"  候補総数={len(ranked)} / 読み込み上限={max_downloads}（modifiedTime新しい順）",
+    ]
 
     selections: dict[str, DeviceCsvSelection] = {}
-    for device_id, items in by_device_files.items():
-        # modifiedTime で最新ファイルを選択（ファイル名は使わない）
-        best_info, best_df = max(items, key=lambda pair: pair[0].sort_key)
-        sel = DeviceCsvSelection(
-            device_id=device_id,
-            file=best_info,
-            df=best_df,
-            record_count=len(best_df),
-        )
-        selections[device_id] = sel
-        log_latest_csv_selection(best_info, [p[0] for p in items])
+    inspected = 0
+    for info in ranked:
+        if inspected >= max_downloads and len(selections) >= 1:
+            break
+        inspected += 1
+        try:
+            content, _ = _load_file_content(info)
+            df = read_csv_bytes(content)
+        except Exception as e:
+            log_lines.append(
+                f"  skip: name={info.name} fileId={info.file_id} error={e}"
+            )
+            continue
+
+        device_id = infer_device_id(info, df)
         log_lines.append(
-            f"  --> 端末 {device_id} の最新: {best_info.name} | "
-            f"fileId={best_info.file_id} | modifiedTime={best_info.modified_time or '-'} | "
-            f"records={len(best_df)}"
+            f"  検査: name={info.name} fileId={info.file_id} "
+            f"modifiedTime={info.modified_time or '-'} device={device_id} rows={len(df)}"
+        )
+        # 新しい順に見ているので、端末ごとに最初に見つかったものが最新
+        if device_id not in selections:
+            selections[device_id] = DeviceCsvSelection(
+                device_id=device_id,
+                file=info,
+                df=df,
+                record_count=len(df),
+            )
+            log_latest_csv_selection(info, ranked)
+            log_lines.append(
+                f"  --> 端末 {device_id} の最新: {info.name} | "
+                f"fileId={info.file_id} | modifiedTime={info.modified_time or '-'} | "
+                f"records={len(df)}"
+            )
+
+    if not selections:
+        raise FileNotFoundError(
+            "フォルダ内のCSVを読み取れませんでした。"
+            "共有設定またはファイル形式を確認してください。"
         )
 
     selection_log = "\n".join(log_lines)
