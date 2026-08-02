@@ -4,3 +4,5 @@ plotly
 openpyxl
 numpy
 reportlab
+google-auth
+requests

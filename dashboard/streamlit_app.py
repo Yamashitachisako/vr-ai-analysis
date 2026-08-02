@@ -152,6 +152,17 @@ def get_google_api_key() -> str | None:
     return key or None
 
 
+def get_drive_auth_caption() -> tuple[str | None, bool]:
+    """(client_email, token_ok)"""
+    try:
+        from app.drive_auth import auth_status
+
+        status = auth_status()
+        return status.get("client_email"), bool(status.get("token_ok"))
+    except Exception:
+        return None, False
+
+
 def extract_google_drive_file_id(url: str) -> str:
     from app.drive_latest import extract_drive_file_id
 
@@ -531,32 +542,41 @@ load_from_upload = st.button(
     key="load_from_upload_btn",
 )
 
-st.markdown("**Google Drive / ローカルからCSVを取り込む**")
-drive_url = st.text_input(
-    "Google DriveのフォルダURL",
-    value=DEFAULT_DRIVE_CSV_URL,
-    help=(
-        "常に folderId=1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9 内のCSV一覧を再取得し、"
-        "modifiedTimeが最新のものを使います。単体ファイルURLは使いません。"
-    ),
+st.markdown("**Google Drive からCSVを取り込む**")
+st.info(
+    f"読み込み先は固定フォルダのみです（単体CSVファイルIDは使いません）。  \n"
+    f"[フォルダを開く]({DEFAULT_DRIVE_CSV_URL}) ／ "
+    f"`folderId={DEFAULT_DRIVE_FOLDER_ID}`  \n"
+    "毎回このフォルダ内のCSV一覧を再取得し、**modifiedTime** が最新のものを使います。"
 )
-st.caption(
-    "固定フォルダ: [csv - Google Drive](https://drive.google.com/drive/folders/1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9)"
-)
-st.caption(
-    "一覧取得に失敗する場合は、下の Google API Key を入力するか、"
-    "Streamlit Cloud の Secrets に `GOOGLE_API_KEY` を設定してください。"
-)
+drive_url = DEFAULT_DRIVE_CSV_URL  # 固定。ユーザー入力の単体 fileId は使わない。
+
+sa_email, sa_ok = get_drive_auth_caption()
+if sa_email:
+    if sa_ok:
+        st.success(f"サービスアカウント認証OK: `{sa_email}`")
+    else:
+        st.warning(
+            f"サービスアカウントは設定済みですがトークン取得に失敗しています: `{sa_email}`"
+        )
+    st.caption(
+        "このメールアドレスに Google Drive フォルダを「閲覧者」で共有してください。"
+    )
+else:
+    st.warning(
+        "Cloud ではサービスアカウント認証が必要です。"
+        "Streamlit Secrets に `[gcp_service_account]` を設定し、"
+        "表示される client_email へフォルダを共有してください。"
+        "（例: `.streamlit/secrets.toml.example` を参照）"
+    )
+
 api_key_input = st.text_input(
-    "Google API Key（推奨・フォルダ一覧用）",
+    "Google API Key（任意・フォールバック）",
     value="",
     type="password",
-    help=(
-        "Google Cloud Console で Drive API を有効化した API キー。"
-        "未設定でも公開フォルダの取得を試みますが、Cloud 環境では API キーが確実です。"
-    ),
+    help="サービスアカウントが使えない場合の補助です。通常は Secrets のサービスアカウントを使います。",
 )
-prefer_local = False  # sample / ローカル仮データは使わず、常に Google Drive から取得
+prefer_local = False
 st.caption("データソース: Google Drive 実CSVのみ（sample_session.csv / 仮データは使用しません）")
 load_from_drive = st.button(
     "最新CSVを取り込む",
@@ -836,9 +856,15 @@ else:
         "👆 左の「全員 / 個人」を選んでから「最新CSVを取り込む」を押してください。"
         "全員＝最大4台統合 / 個人＝選んだ1台のみ。切り替え時は再取得します。"
     )
-    st.markdown("""
+    st.markdown(f"""
     **取り込みルール：**
-    - **全員** → VR4台それぞれの最新CSVを統合
+    - 読み込み先は固定フォルダのみ
+      （[{DEFAULT_DRIVE_FOLDER_ID}]({DEFAULT_DRIVE_CSV_URL})）
+    - 単体CSVファイルIDは使わない
+    - 毎回フォルダ内CSV一覧を再取得し、**modifiedTime** 最新を使用
+    - Cloud はサービスアカウント認証（Secrets の `[gcp_service_account]`）
+    - フォルダをサービスアカウントの `client_email` に共有すること
+    - **全員** → VR最大4台それぞれの最新CSVを統合
     - **個人** → 選択した1台（`Player_ID`）の最新CSVのみ
     - 列名は実CSVヘッダーどおり（`Elapsed_Time`, `Event_Type`, `Player_ID` など）
     """)

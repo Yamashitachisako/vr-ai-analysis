@@ -1,20 +1,28 @@
 # -*- coding: utf-8 -*-
-"""Drive フォルダ一覧の回帰テスト。"""
+"""Drive フォルダ一覧・サービスアカウント周りのテスト。"""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.drive_latest import (
     DEFAULT_DRIVE_FOLDER_ID,
+    DEFAULT_DRIVE_FOLDER_URL,
     _parse_embedded_folder_html,
     list_drive_csvs_embedded,
     list_drive_folder_csvs,
 )
+
+
+def test_fixed_folder_constants():
+    assert DEFAULT_DRIVE_FOLDER_ID == "1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9"
+    assert DEFAULT_DRIVE_FOLDER_ID in DEFAULT_DRIVE_FOLDER_URL
+    print("OK fixed folder constants")
 
 
 def test_parse_sample_html():
@@ -33,18 +41,49 @@ def test_parse_sample_html():
     print("OK parse sample html")
 
 
-def test_live_folder_list():
-    files = list_drive_csvs_embedded(DEFAULT_DRIVE_FOLDER_ID)
+def test_service_account_preferred_over_html():
+    from app.drive_latest import CsvFileInfo
+
+    fake = [
+        CsvFileInfo(
+            file_id="abc",
+            name="Log_x_20260701_120000.csv",
+            modified_time="2026-07-01T12:00:00Z",
+            source="drive",
+        )
+    ]
+    with patch("app.drive_auth.get_service_account_email", return_value="sa@test.iam.gserviceaccount.com"), \
+         patch("app.drive_latest.list_drive_csvs_service_account", return_value=fake) as sa_list, \
+         patch("app.drive_latest.list_drive_csvs_embedded") as emb:
+        files = list_drive_folder_csvs(DEFAULT_DRIVE_FOLDER_ID, api_key=None)
+        assert files == fake
+        sa_list.assert_called_once()
+        emb.assert_not_called()
+    print("OK service account preferred")
+
+
+def test_live_folder_list_fallback():
+    # SA が無い環境では embedded フォールバック
+    files = list_drive_folder_csvs(DEFAULT_DRIVE_FOLDER_ID, api_key=None)
     assert len(files) >= 1, f"expected csvs, got {len(files)}"
     assert any(f.name.lower().endswith(".csv") for f in files)
-    print(f"OK embedded live list: {len(files)} files, sample={files[0].name}")
+    print(f"OK folder_csvs fallback/live: {len(files)} files, sample={files[0].name}")
 
-    all_files = list_drive_folder_csvs(DEFAULT_DRIVE_FOLDER_ID, api_key=None)
-    assert len(all_files) >= 1
-    print(f"OK folder_csvs: {len(all_files)}")
+
+def test_auth_module_without_secrets():
+    from app.drive_auth import get_service_account_email, load_service_account_info
+
+    # 通常のローカルでは未設定のはず
+    info = load_service_account_info()
+    email = get_service_account_email()
+    assert (info is None and email is None) or (email and info)
+    print(f"OK auth module (configured={bool(email)})")
 
 
 if __name__ == "__main__":
+    test_fixed_folder_constants()
     test_parse_sample_html()
-    test_live_folder_list()
+    test_service_account_preferred_over_html()
+    test_auth_module_without_secrets()
+    test_live_folder_list_fallback()
     print("ALL TESTS PASSED")

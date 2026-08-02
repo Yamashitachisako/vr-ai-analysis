@@ -176,41 +176,88 @@ def list_local_csvs(directory: Path | str = LOCAL_CSV_DIR) -> list[CsvFileInfo]:
 
 
 def list_drive_csvs_api(folder_id: str, api_key: str) -> list[CsvFileInfo]:
-    """Drive API v3 でフォルダ内CSVを一覧（modifiedTime降順）。"""
+    """Drive API v3 + API Key でフォルダ内CSVを一覧（modifiedTime降順）。"""
+    return _list_drive_csvs_api_paged(folder_id, auth_header=None, api_key=api_key)
+
+
+def list_drive_csvs_service_account(folder_id: str) -> list[CsvFileInfo]:
+    """サービスアカウントでフォルダ内CSVを一覧（modifiedTime降順）。"""
+    from app.drive_auth import get_drive_access_token, get_service_account_email
+
+    token = get_drive_access_token()
+    if not token:
+        raise RuntimeError(
+            "サービスアカウントのアクセストークンを取得できません。"
+            "Streamlit Secrets の [gcp_service_account] を確認し、"
+            f"フォルダを {get_service_account_email() or '(client_email)'} に共有してください。"
+        )
+    files = _list_drive_csvs_api_paged(
+        folder_id,
+        auth_header=f"Bearer {token}",
+        api_key=None,
+    )
+    logger.info(
+        "drive service account listed %s csv files in folder %s email=%s",
+        len(files),
+        folder_id,
+        get_service_account_email(),
+    )
+    return files
+
+
+def _list_drive_csvs_api_paged(
+    folder_id: str,
+    *,
+    auth_header: str | None,
+    api_key: str | None,
+) -> list[CsvFileInfo]:
     query = (
         f"'{folder_id}' in parents and trashed=false and "
         f"(mimeType='text/csv' or mimeType='application/vnd.ms-excel' or name contains '.csv')"
     )
-    params = {
-        "q": query,
-        "fields": "files(id,name,modifiedTime,createdTime,mimeType)",
-        "orderBy": "modifiedTime desc",
-        "pageSize": "100",
-        "supportsAllDrives": "true",
-        "includeItemsFromAllDrives": "true",
-        "key": api_key,
-    }
-    url = "https://www.googleapis.com/drive/v3/files?" + urlencode(params)
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(request, timeout=60) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-
     files: list[CsvFileInfo] = []
-    for item in payload.get("files", []):
-        name = item.get("name") or ""
-        if not name.lower().endswith(".csv"):
-            # mimeType text/csv でも名前に.csvが無い場合は含める
-            if item.get("mimeType") != "text/csv":
-                continue
-        files.append(
-            CsvFileInfo(
-                file_id=item["id"],
-                name=name,
-                modified_time=item.get("modifiedTime"),
-                created_time=item.get("createdTime"),
-                source="drive",
+    page_token: str | None = None
+    while True:
+        params: dict[str, str] = {
+            "q": query,
+            "fields": "nextPageToken,files(id,name,modifiedTime,createdTime,mimeType)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": "1000",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "corpora": "allDrives",
+        }
+        if api_key:
+            params["key"] = api_key
+        if page_token:
+            params["pageToken"] = page_token
+
+        url = "https://www.googleapis.com/drive/v3/files?" + urlencode(params)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        for item in payload.get("files", []):
+            name = item.get("name") or ""
+            if not name.lower().endswith(".csv"):
+                if item.get("mimeType") != "text/csv":
+                    continue
+            files.append(
+                CsvFileInfo(
+                    file_id=item["id"],
+                    name=name,
+                    modified_time=item.get("modifiedTime"),
+                    created_time=item.get("createdTime"),
+                    source="drive",
+                )
             )
-        )
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
+
     logger.info("drive api listed %s csv files in folder %s", len(files), folder_id)
     return files
 
@@ -410,21 +457,61 @@ def list_drive_csvs_public_html(folder_id: str) -> list[CsvFileInfo]:
 
 
 def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[CsvFileInfo]:
+    """固定フォルダ内のCSV一覧を取得する。
+
+    優先順:
+      1. サービスアカウント（Cloud 推奨）
+      2. API Key
+      3. 公開 embeddedfolderview / HTML（フォールバック）
+    """
+    if folder_id != DEFAULT_DRIVE_FOLDER_ID:
+        logger.warning(
+            "folder_id=%s を無視し、固定 folderId=%s を使います。",
+            folder_id,
+            DEFAULT_DRIVE_FOLDER_ID,
+        )
+        folder_id = DEFAULT_DRIVE_FOLDER_ID
+
     errors: list[str] = []
+
+    # 1) サービスアカウント
+    try:
+        from app.drive_auth import get_service_account_email
+
+        sa_email = get_service_account_email()
+    except Exception:
+        sa_email = None
+
+    if sa_email:
+        try:
+            files = list_drive_csvs_service_account(folder_id)
+            if files:
+                return files
+            errors.append(
+                f"サービスアカウント({sa_email}): CSVが0件。"
+                "フォルダをこのメールに共有しているか確認してください。"
+            )
+        except Exception as e:
+            logger.warning("drive service account list failed: %s", e)
+            errors.append(f"サービスアカウント({sa_email}): {e}")
+    else:
+        errors.append("サービスアカウント未設定（Secrets の [gcp_service_account]）")
+
+    # 2) API Key
     key = (api_key or os.environ.get("GOOGLE_API_KEY") or "").strip() or None
     if key:
         try:
             files = list_drive_csvs_api(folder_id, key)
             if files:
                 return files
-            errors.append("Drive API: CSVが0件でした。")
+            errors.append("Drive API Key: CSVが0件でした。")
         except Exception as e:
             logger.warning("drive api list failed: %s", e)
-            errors.append(f"Drive API: {e}")
+            errors.append(f"Drive API Key: {e}")
     else:
         errors.append("GOOGLE_API_KEY 未設定")
 
-    # 公開フォルダ向け: embeddedfolderview が最も安定
+    # 3) 公開フォルダフォールバック
     try:
         files = list_drive_csvs_embedded(folder_id)
         if files:
@@ -450,18 +537,70 @@ def list_drive_folder_csvs(folder_id: str, api_key: str | None = None) -> list[C
         errors.append(f"公開フォルダHTML: {e}")
 
     detail = " / ".join(errors) if errors else "不明なエラー"
+    share_hint = ""
+    if sa_email:
+        share_hint = (
+            f" Google Drive フォルダをサービスアカウント "
+            f"`{sa_email}` に「閲覧者」で共有してください。"
+        )
+    else:
+        share_hint = (
+            " Streamlit Cloud Secrets に [gcp_service_account] を設定し、"
+            "その client_email へフォルダを共有してください。"
+        )
     raise FileNotFoundError(
         "フォルダ内のCSV一覧を取得できませんでした。"
         f"（{detail}） "
-        f"対象フォルダ: https://drive.google.com/drive/folders/{folder_id} 。"
-        "共有を「リンクを知っている全員が閲覧可」にし、"
-        "画面の Google API Key 欄、または Streamlit Cloud Secrets の "
-        "GOOGLE_API_KEY を設定してください。"
+        f"対象フォルダ: {DEFAULT_DRIVE_FOLDER_URL} 。"
+        f"{share_hint}"
     )
 
 
 def download_drive_file(file_id: str, timeout: int = 60) -> tuple[bytes, str | None]:
-    """ファイルIDから毎回新規ダウンロード（キャッシュなし）。"""
+    """ファイルIDから毎回新規ダウンロード（キャッシュなし）。
+
+    サービスアカウントがあれば Drive API alt=media を優先。
+    """
+    # 単体ファイルの固定読み込み禁止（レガシーID）
+    if file_id == LEGACY_SINGLE_FILE_ID:
+        raise ValueError(
+            "単体CSVファイルIDの固定読み込みは禁止です。"
+            f"フォルダ {DEFAULT_DRIVE_FOLDER_ID} 内の一覧から選んでください。"
+        )
+
+    try:
+        from app.drive_auth import get_drive_access_token
+
+        token = get_drive_access_token()
+    except Exception:
+        token = None
+
+    if token:
+        try:
+            url = (
+                f"https://www.googleapis.com/drive/v3/files/{file_id}"
+                f"?alt=media&supportsAllDrives=true"
+            )
+            request = Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "Mozilla/5.0",
+                    "Cache-Control": "no-cache",
+                },
+            )
+            with urlopen(request, timeout=timeout) as resp:
+                content = resp.read()
+                modified = resp.headers.get("Last-Modified")
+            if content and not (
+                content[:15].lower().startswith(b"<!doctype")
+                or content[:6].lower().startswith(b"<html")
+            ):
+                return content, modified
+            logger.warning("service account download returned HTML; falling back")
+        except Exception as e:
+            logger.warning("service account download failed: %s; falling back", e)
+
     download_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
     request = Request(
         download_url,
@@ -475,7 +614,6 @@ def download_drive_file(file_id: str, timeout: int = 60) -> tuple[bytes, str | N
         content = resp.read()
         modified = resp.headers.get("Last-Modified")
     if content[:15].lower().startswith(b"<!doctype") or content[:6].lower().startswith(b"<html"):
-        # confirm token retry
         text = content.decode("utf-8", errors="ignore")
         confirm = re.search(r"confirm=([0-9A-Za-z_]+)", text)
         if confirm:
@@ -483,13 +621,18 @@ def download_drive_file(file_id: str, timeout: int = 60) -> tuple[bytes, str | N
                 f"https://drive.google.com/uc?export=download&id={file_id}"
                 f"&confirm={confirm.group(1)}"
             )
-            request = Request(download_url, headers={"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"})
+            request = Request(
+                download_url,
+                headers={"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"},
+            )
             with urlopen(request, timeout=timeout) as resp2:
                 content = resp2.read()
                 modified = resp2.headers.get("Last-Modified")
     if content[:15].lower().startswith(b"<!doctype") or content[:6].lower().startswith(b"<html"):
         raise ValueError(
-            "CSVではなくHTMLが返されました。共有設定が「リンクを知っている全員が閲覧可」か確認してください。"
+            "CSVではなくHTMLが返されました。"
+            "サービスアカウントへフォルダ共有するか、"
+            "共有を「リンクを知っている全員が閲覧可」にしてください。"
         )
     return content, modified
 
