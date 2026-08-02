@@ -398,6 +398,57 @@ def apply_import_policy(
         mark_imported=(mode == "new_only"),
     )
 
+
+def merge_selection_frames(selections: list) -> pd.DataFrame:
+    frames = [s.df.copy() for s in selections if getattr(s, "df", None) is not None]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def resolve_display_dataframe(
+    *,
+    selections: list,
+    result: dict,
+    import_mode: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    """表示用 DataFrame を決める。
+
+    ユーザー要望: 取り込みボタンでは常に最新CSVを再取得して表示・分析する。
+    - 常に最新再分析 / 全件: result["df"]（=最新全件）
+    - 新規追加分のみ: 差分が0でも最新CSV全件を表示（内容確認用）
+    - 期間指定: result["df"]（期間フィルタ後）
+    """
+    notes: list[str] = list(result.get("notes") or [])
+    latest_df = merge_selection_frames(selections)
+    selected = result.get("df")
+    if selected is None:
+        selected = pd.DataFrame()
+
+    if import_mode == "new_only":
+        new_rows = int(result.get("selected_rows") or 0)
+        if new_rows == 0 and len(latest_df) > 0:
+            notes.append(
+                f"新規追加分は 0 件でしたが、最新CSVの全 {len(latest_df)} 行を表示しています"
+                "（内容確認・再分析用）。"
+            )
+            return latest_df.copy(), notes
+        if new_rows > 0 and len(latest_df) > new_rows:
+            # 差分だけだと全体が見えないため、表示は最新全件、差分件数は注記
+            notes.append(
+                f"新規追加分は {new_rows} 行です。表示・分析は最新CSV全 {len(latest_df)} 行で行います。"
+            )
+            return latest_df.copy(), notes
+        return (selected.copy() if len(selected) else latest_df.copy()), notes
+
+    if import_mode in ("all", "always_latest"):
+        # 念のため最新結合を優先
+        if len(latest_df) > 0:
+            return latest_df.copy(), notes
+        return selected.copy(), notes
+
+    return selected.copy(), notes
+
 def render_pdf_section(report_df: pd.DataFrame) -> None:
     """グラフ表示の下に必ず表示する PDF レポート生成セクション。"""
     st.markdown("---")
@@ -515,19 +566,30 @@ with st.sidebar:
     st.markdown("### 📥 取り込み設定")
     import_mode_label = st.radio(
         "分析対象行",
-        options=["全件（再分析）", "新規追加分のみ", "期間指定"],
+        options=[
+            "常に最新CSVを再分析（推奨）",
+            "新規追加分のみ（履歴差分）",
+            "期間指定",
+        ],
         index=0,
         help=(
-            "全件（再分析）: 取り込んだCSVをすべて表示（推奨）。"
-            "新規追加分のみ: 過去に取り込み済みの行は除外します（再実行で0行になることがあります）。"
+            "常に最新CSVを再分析: ボタン押下のたびに Drive 最新CSVを再取得して全件表示（推奨）。"
+            "新規追加分のみ: 履歴差分の件数も計算しますが、表示は最新CSV全件です。"
+            "期間指定: 日付で絞り込みます。"
         ),
+        key="import_mode_radio",
     )
     mode_map = {
-        "新規追加分のみ": "new_only",
+        "常に最新CSVを再分析（推奨）": "always_latest",
+        "新規追加分のみ（履歴差分）": "new_only",
         "期間指定": "date_range",
-        "全件（再分析）": "all",
+        # 旧ラベル互換
+        "全件（再分析）": "always_latest",
+        "新規追加分のみ": "new_only",
     }
     import_mode = mode_map[import_mode_label]
+    # incremental_loader へ渡す内部モード
+    policy_mode = "all" if import_mode == "always_latest" else import_mode
 
     start_date = None
     end_date = None
@@ -536,7 +598,7 @@ with st.sidebar:
         start_date = c1.date_input("開始日")
         end_date = c2.date_input("終了日")
     else:
-        st.caption("期間指定モードにすると開始日・終了日を選べます。")
+        st.caption("ボタンを押すたびに Google Drive の最新CSVを再取得して表示します。")
 
     date_column_override = st.text_input(
         "日付カラム名（任意）",
@@ -691,23 +753,28 @@ if load_from_upload:
 
         result = apply_import_policy_for_selections(
             used,
-            import_mode=import_mode,
+            import_mode=policy_mode,
             start_date=start_date,
             end_date=end_date,
             date_column=date_column_override.strip() or None,
         )
-        headers = list(result["df"].columns)
+        display_df, display_notes = resolve_display_dataframe(
+            selections=used,
+            result=result,
+            import_mode=import_mode,
+        )
+        headers = list(display_df.columns)
         player_ids = players
         usage_log = format_vr_usage_log(
             mode=analysis_mode,
             selected_device=selected_device,
             selections=used,
-            record_count=result["selected_rows"],
+            record_count=len(display_df),
             headers=headers,
             player_ids=player_ids,
         )
         logger.info(usage_log)
-        st.session_state.df = result["df"]
+        st.session_state.df = display_df
         st.session_state.had_successful_load = True
         source_names = ", ".join(s.file.name for s in used)
         st.session_state.import_meta = {
@@ -720,6 +787,8 @@ if load_from_upload:
             "selected_device": selected_device,
             "headers": headers,
             "player_ids": player_ids,
+            "display_rows": len(display_df),
+            "import_mode_label": import_mode_label,
             "files": [
                 {
                     "device": s.device_id,
@@ -740,11 +809,16 @@ if load_from_upload:
         st.success(
             f"アップロード完了（モード: {scope_label}）／ "
             f"端末 {len(used)} 台分／ "
-            f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
+            f"最新CSV {result['total_rows']}行 → 表示 {len(display_df)}行"
+            + (
+                f"（うち新規 {result['selected_rows']}行）"
+                if import_mode == "new_only"
+                else ""
+            )
         )
         with st.expander("使用CSVログ", expanded=True):
             st.code(usage_log)
-        for note in result.get("notes") or []:
+        for note in display_notes:
             st.info(note)
     except Exception as e:
         st.error(f"CSVの読み込みエラー: {e}")
@@ -771,26 +845,31 @@ elif do_drive_load:
             st.session_state.available_devices = players
             result = apply_import_policy_for_selections(
                 vr_result.selections,
-                import_mode=import_mode,
+                import_mode=policy_mode,
                 start_date=start_date,
                 end_date=end_date,
                 date_column=date_column_override.strip() or None,
             )
+            display_df, display_notes = resolve_display_dataframe(
+                selections=vr_result.selections,
+                result=result,
+                import_mode=import_mode,
+            )
             # import 後もヘッダーを維持。端末一覧は最大4台の選定結果を正とする。
-            headers = list(result["df"].columns) if result["df"] is not None else list(vr_result.headers)
+            headers = list(display_df.columns) if display_df is not None else list(vr_result.headers)
             player_ids = players
             usage_log = format_vr_usage_log(
                 mode=analysis_mode,
                 selected_device=selected_device,
                 selections=vr_result.selections,
-                record_count=result["selected_rows"],
+                record_count=len(display_df),
                 headers=headers,
                 player_ids=player_ids,
             )
             logger.info(usage_log)
             for line in (selection_log or "").splitlines():
                 logger.info(line)
-        st.session_state.df = result["df"]
+        st.session_state.df = display_df
         st.session_state.had_successful_load = True
         st.session_state.import_meta = {
             **result,
@@ -801,6 +880,8 @@ elif do_drive_load:
             "selected_device": selected_device,
             "headers": headers,
             "player_ids": player_ids,
+            "display_rows": len(display_df),
+            "import_mode_label": import_mode_label,
             "files": [
                 {
                     "device": s.device_id,
@@ -821,26 +902,23 @@ elif do_drive_load:
         }
         st.success(
             f"取り込み完了（モード: {scope_label}"
-            + (f" / 端末: {selected_device}" if selected_device else " / 最大4台統合")
+            + (f" / 端末: {selected_device}" if selected_device else " / 端末ごと最新を統合")
             + f"）／ 使用ファイル {len(vr_result.selections)} 件／ "
-            f"全{result['total_rows']}行 → 分析対象 {result['selected_rows']}行"
+            f"最新CSV {result['total_rows']}行 → 表示 {len(display_df)}行"
+            + (
+                f"（うち新規 {result['selected_rows']}行）"
+                if import_mode == "new_only"
+                else ""
+            )
         )
         with st.expander("使用CSV・選定ログ", expanded=True):
             st.code((selection_log or "") + "\n\n" + usage_log)
-        for note in result.get("notes") or []:
+        for note in display_notes:
             st.info(note)
-        if result["selected_rows"] == 0:
-            if import_mode == "new_only":
-                st.warning(
-                    "分析対象が 0 件です。「新規追加分のみ」では、過去に取り込み済みの行は除外されます。"
-                    "これは仕様です。データを表示するには左の取り込み設定で "
-                    "「全件（再分析）」を選んで再度「最新CSVを取り込む」を押してください。"
-                )
-            else:
-                st.warning(
-                    "分析対象が 0 件です。期間に該当するデータがないか、CSVが空です。"
-                    "期間指定を変更するか「全件（再分析）」を試してください。"
-                )
+        if len(display_df) == 0:
+            st.warning(
+                "表示データが 0 件です。期間に該当するデータがないか、CSVが空です。"
+            )
     except Exception as e:
         st.session_state.force_csv_reload = False
         st.error(f"CSVの取得エラー: {e}")
@@ -858,7 +936,7 @@ if df is not None:
         st.caption(
             f"使用中CSV: {name} / modifiedTime: {modified} / 選択モード: {mode_disp}"
             + (f"({meta.get('selected_device')})" if meta.get("selected_device") else "")
-            + f" / 取り込み: {meta.get('mode')} / "
+            +             f" / 取り込み: {meta.get('import_mode_label') or meta.get('mode')} / "
             f"元データ {meta.get('total_rows')} 行 → 表示中 {len(df)} 行"
             + (f" / 日付カラム: {meta.get('date_column_used')}" if meta.get("date_column_used") else "")
         )

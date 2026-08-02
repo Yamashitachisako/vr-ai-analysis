@@ -86,6 +86,27 @@ def test_normalize_quoted_key():
     print("OK normalize quoted key")
 
 
+def test_normalize_triple_quoted_newlines():
+    """三重引用符相当（実改行入り）でも正規化できること。"""
+    body = base64.b64encode(b"\x03" * 80).decode("ascii")
+    wrapped = "\n".join(body[i : i + 64] for i in range(0, len(body), 64))
+    info = _normalize_private_key(
+        {
+            "client_email": "a@b.com",
+            "private_key": (
+                "-----BEGIN PRIVATE KEY-----\n"
+                + wrapped
+                + "\n-----END PRIVATE KEY-----\n"
+            ),
+        }
+    )
+    key = info["private_key"]
+    assert "\\n" not in key
+    assert key.startswith("-----BEGIN PRIVATE KEY-----\n")
+    assert key.endswith("-----END PRIVATE KEY-----\n")
+    print("OK normalize triple-quoted newlines")
+
+
 def test_device_key_from_filename():
     assert device_key_from_filename("Log_Quest 3S_20260801_094820.csv") == "Quest 3S"
     assert device_key_from_filename("Log_LAPTOP-C6T7L3C5_20260509_165331.csv") == "LAPTOP-C6T7L3C5"
@@ -122,6 +143,7 @@ if __name__ == "__main__":
     test_normalize_escaped_newlines()
     test_normalize_strips_invalid_dot_symbol_46()
     test_normalize_quoted_key()
+    test_normalize_triple_quoted_newlines()
     test_device_key_from_filename()
     test_infer_keeps_player_id()
     test_player_summary_and_chart_includes_all()

@@ -101,11 +101,12 @@ def _from_env_or_file() -> dict[str, Any] | None:
 def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
     """Streamlit TOML / Cloud Secrets 由来の private_key を PEM として使える形に直す。
 
-    Cloud で多い失敗:
-      - `\\n` が実改行にならない
-      - base64 本体に不正文字（例: `.` = symbol 46）が混入
+    対応形式:
+      - 1行 + リテラル `\\n`（Cloud Secrets で多い）
+      - 三重引用符の実改行
+      - 前後の余分な引用符
+      - base64 本体への不正文字混入（例: `.` = ASCII 46 → Unable to load PEM）
     """
-    import base64
     import re
 
     out = {str(k): v for k, v in info.items()}
@@ -114,7 +115,8 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
     if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
         key = key[1:-1].strip()
 
-    # エスケープ改行を実改行へ（多重エスケープも解消）
+    # 必須: Secrets の \\n を実改行へ（多重エスケープも解消）
+    # ユーザー指定どおり private_key.replace("\\n", "\n") を適用
     for _ in range(5):
         if "\\n" in key:
             key = key.replace("\\n", "\n")
@@ -130,7 +132,6 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
         flags=re.DOTALL,
     )
     if not m:
-        # ラベル不一致でも BEGIN/END があれば salvage
         m2 = re.search(
             r"-----BEGIN ([^-]+)-----(.*?)-----END ([^-]+)-----",
             key,
@@ -140,6 +141,7 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
             msg = "private_key から PEM BEGIN/END ブロックを抽出できません"
             logger.warning(msg)
             _token_holder["last_error"] = msg
+            # 最低限 \\n 置換済みの文字列を返す
             out["private_key"] = key + ("\n" if not key.endswith("\n") else "")
             return out
         label = m2.group(1).strip()
@@ -148,7 +150,7 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
         label = m.group(1).strip()
         body = m.group(2)
 
-    # base64 として不正な文字（`.`=46 など）と空白を除去
+    # base64 として不正な文字（`.`=46 など）を除去。空白は後で折り返し直す
     cleaned = re.sub(r"[^A-Za-z0-9+/=]", "", body)
     removed = len(re.sub(r"\s+", "", body)) - len(cleaned)
     if removed > 0:
@@ -157,20 +159,11 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
             removed,
         )
 
-    # base64 として decode → encode し直して検証
-    try:
-        # padding 補正
-        pad = (-len(cleaned)) % 4
-        if pad:
-            cleaned += "=" * pad
-        raw = base64.b64decode(cleaned, validate=False)
-        cleaned = base64.b64encode(raw).decode("ascii")
-    except Exception as e:
-        msg = f"private_key base64 の検証に失敗: {type(e).__name__}: {e}"
-        logger.warning(msg)
-        _token_holder["last_error"] = msg
+    # padding 補正のみ（decode/re-encode は鍵破損リスクがあるため行わない）
+    pad = (-len(cleaned)) % 4
+    if pad:
+        cleaned += "=" * pad
 
-    # 64文字折り返しで正規 PEM を再構築
     lines = [cleaned[i : i + 64] for i in range(0, len(cleaned), 64)]
     pem = "-----BEGIN " + label + "-----\n"
     pem += "\n".join(lines)
@@ -199,7 +192,6 @@ def _normalize_private_key(info: dict[str, Any]) -> dict[str, Any]:
     if not out.get("token_uri"):
         out["token_uri"] = "https://oauth2.googleapis.com/token"
 
-    # 診断ログ（秘密本体は出さない）
     logger.info(
         "private_key normalized: label=%s pem_len=%s has_newline=%s client_email=%s",
         label,
