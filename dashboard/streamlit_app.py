@@ -7,7 +7,9 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -117,10 +119,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-from app.drive_latest import DEFAULT_DRIVE_FOLDER_URL
-
 # 単体CSVファイルは使わない。親フォルダ内を毎回一覧取得する。
-DEFAULT_DRIVE_CSV_URL = DEFAULT_DRIVE_FOLDER_URL
+# （Cloud でも確実に動くよう、ここでは app を import せず定数を直書きする）
+DEFAULT_DRIVE_FOLDER_ID = "1ClTITbRVQc_hiDDIF5lfEEEttJs5qTc9"
+DEFAULT_DRIVE_CSV_URL = (
+    f"https://drive.google.com/drive/folders/{DEFAULT_DRIVE_FOLDER_ID}"
+)
 
 def reset_load_state() -> None:
     """アップロード／Drive取得前に前回の選択・キャッシュをクリアする。"""
